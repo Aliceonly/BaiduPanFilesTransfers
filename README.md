@@ -8,7 +8,7 @@
 
 ## 下载及运行
 
-程序开发编译环境为 `Win10 x64` 专业版，操作系统 `Win7` 以上可直接下载运行，其他操作系统需要自行编译或配置运行环境。
+原版程序开发编译环境为 `Win10 x64` 专业版。以下是原作者的历史下载渠道，不一定包含本仓库新增的修复。要使用本仓库的最新代码，请按 [Windows EXE 打包指南](docs/BUILD_WINDOWS.md) 自行打包，或配置 Python 环境运行源码。当前打包说明以 Windows 10/11 x64 为目标，不保证 Windows 7 兼容性。
 
 下载方式：
 
@@ -19,72 +19,23 @@
 
 ## 手动编译
 
-手动编译需要事先安装好 `Python 3.6` 以上版本。
+完整步骤见 [Windows EXE 打包指南](docs/BUILD_WINDOWS.md)，包含环境安装、测试、单文件打包、Debug 版本和常见问题。
 
-编译步骤如下：
+必须在 Windows 上构建 Windows `.exe`；PyInstaller 不是 cross-compiler，不能直接在 macOS/Linux 上生成 Windows 可执行程序。
 
-1. 在安装有 `Git` 的主机上克隆本项目：
+以 Windows PowerShell 和官方 Python 3.12 x64 为例：
 
-   ```sh
-   git clone https://github.com/hxz393/BaiduPanFilesTransfers.git
-   ```
+```powershell
+git clone https://github.com/Aliceonly/BaiduPanFilesTransfers.git
+cd .\BaiduPanFilesTransfers
+py -3.12 -m venv venv
+.\venv\Scripts\python.exe -m pip install --upgrade pip
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+.\venv\Scripts\python.exe -m pytest -q tests src/test.py
+.\venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --name BaiduPanFilesTransfers --icon .\BaiduPanFilesTransfers.ico --hidden-import tkinter --collect-all ttkbootstrap .\BaiduPanFilesTransfers.py
+```
 
-   或者在 [项目主页](https://github.com/hxz393/BaiduPanFilesTransfers) 点击蓝色`<> Code` 按钮选择 `Download ZIP` 选项，[下载](https://github.com/hxz393/BaiduPanFilesTransfers/archive/refs/heads/master.zip) 源码压缩包，下载完毕后解压缩压缩包。
-
-2. 在命令行中切换到本项目路径。
-
-   例如，在 Windows 中，打开 `CMD` 命令提示符或 `PowerShell`，输入：
-
-   ```sh
-   cd B:\2.脚本\BaiduPanFilesTransfers-master
-   ```
-
-   在 Linux/macOS 中，路径的分隔符会不同：
-
-   ```sh
-   cd /root/BaiduPanFilesTransfers-master
-   ```
-
-   如果使用 `PyCharm` 作为 IDE，可以直接在自带的控制台中输入后面的打包命令。
-
-3. 使用 `venv` 创建并启用虚拟环境：
-
-   ```sh
-   python -m venv venv
-   venv\Scripts\activate
-   ```
-
-   在 Linux/macOS 下启动虚拟环境命令稍有不同：
-
-   ````
-   python -m venv venv && source venv/bin/activate
-   ````
-
-4. 安装项目依赖，指定使用国内科大的镜像源：
-
-   ```sh
-   pip install -r requirements.txt --index https://mirrors.ustc.edu.cn/pypi/web/simple/
-   ```
-
-   Windows 的 Python 安装包一般会默认安装 `Tkinter`。macOS 用户则需要手动安装，对应 Homebrew 命令为：
-
-   ```sh
-   brew install python-tk # 也可以指定 Python 版本，如 brew install python-tk@3.12
-   ```
-
-5. 使用 `pyinstaller` 命令编译打包成可执行文件：
-
-   ```sh
-   pyinstaller -F -w -i BaiduPanFilesTransfers.ico --hidden-import=tkinter --clean -n BaiduPanFilesTransfers BaiduPanFilesTransfers.py
-   ```
-
-   如果过程没有异常，可执行文件 `BaiduPanFilesTransfers.exe` 会生成到 `dist` 目录下面。
-
-6. （可选）使用 `deactivate` 命令退出当前环境：
-
-   ```
-   venv\Scripts\deactivate.bat
-   ```
+输出文件为 `dist\BaiduPanFilesTransfers.exe`。直接调用 virtualenv 中的 Python，不需要 activate 或修改 PowerShell Execution Policy。分发时不要附带包含 Cookie 的 `config.ini`。
 
 ## 代码贡献
 
