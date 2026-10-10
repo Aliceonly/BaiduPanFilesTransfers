@@ -30,8 +30,11 @@ class DummyText:
 
 
 class DummyWidget:
-    def config(self, **_kwargs):
-        pass
+    def __init__(self):
+        self.options = {}
+
+    def config(self, **kwargs):
+        self.options.update(kwargs)
 
     def unbind(self, *_args):
         pass
@@ -417,6 +420,343 @@ def test_slashes_in_the_base_directory_do_not_change_allocated_paths():
     operation.handle_process_save()
 
     assert paths == ["target/1"]
+
+
+def make_save_operation(raw_links):
+    operation = Operations(make_root(raw_links))
+    operation.network.get_bdstoken = lambda: "token"
+    operation.network.get_dir_list = lambda *_args: []
+    operation.network.create_dir = lambda *_args: 0
+    operation.network.transfer_file = lambda *_args, **_kwargs: 0
+    operation.verify_link = lambda *_args: VALID_RESULT
+    return operation
+
+
+def interrupt_before_second_item(operation):
+    process_save = operation.process_save
+    interrupted = False
+
+    def process(url_code, raw_link=""):
+        nonlocal interrupted
+        if operation.next_task_index == 1 and not interrupted:
+            interrupted = True
+            raise RuntimeError("batch interrupted")
+        process_save(url_code, raw_link)
+
+    operation.process_save = process
+
+
+def test_interrupted_save_button_resumes_pending_items_and_preserves_directories(monkeypatch):
+    operation = make_save_operation(
+        "https://pan.baidu.com/s/1first 1234\n"
+        "https://pan.baidu.com/s/1second 1234\n"
+        "https://pan.baidu.com/s/1third 1234"
+    )
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+    interrupt_before_second_item(operation)
+
+    operation.save()
+
+    assert operation.next_task_index == operation.completed_task_count == 1
+    assert operation.resume_available is True
+    assert operation.custom_dir_count == 1
+    assert operation.used_custom_dirs == {"target/1"}
+    assert operation.root.bottom_save.options["text"] == "继续转存"
+    assert operation.root.bottom_save.options["state"] == "normal"
+    assert operation.root.bottom_share.options["state"] == "disabled"
+    assert "1/3" in operation.root.label_status.options["text"]
+    logs_before_resume = operation.root.text_logs.value
+    old_session = operation.network.s
+    refreshed_tokens = []
+    operation.network.get_bdstoken = lambda: refreshed_tokens.append(True) or "new-token"
+    operation.root.entry_cookie.value = "BAIDUID=refreshed"
+    operation.root.var_trust_env.value = True
+    # Editing the UI must not change the pending batch's task snapshot.
+    operation.root.text_links.value = "https://pan.baidu.com/s/1replacement 4321"
+    operation.root.entry_folder_name.value = "different-target"
+    operation.root.var_custom_mode.value = False
+    operation.root.var_check_mode.value = True
+    monkeypatch.setattr("src.operations.thread_it", lambda func, *args: func(*args))
+
+    operation.root.bottom_save.options["command"]()
+
+    assert paths == ["target/1", "target/2", "target/3"]
+    assert operation.next_task_index == operation.completed_task_count == 3
+    assert operation.custom_dir_count == 3
+    assert operation.used_custom_dirs == {"target/1", "target/2", "target/3"}
+    assert "target" in operation.created_dirs
+    assert operation.root.text_logs.value.startswith(logs_before_resume)
+    assert operation.root.text_logs.value.count("转存成功") == 3
+    assert operation.network.s is not old_session
+    assert operation.network.s.trust_env is True
+    assert operation.network.headers["Cookie"] == "BAIDUID=refreshed"
+    assert operation.network.bdstoken == "new-token"
+    assert refreshed_tokens == [True]
+    assert operation.resume_available is False
+    assert operation.running is False
+    assert operation.root.bottom_save.options["text"] == "批量转存"
+    assert operation.root.bottom_share.options["state"] == "normal"
+
+
+def test_resume_preserves_successful_normal_link_deduplication():
+    operation = make_save_operation(
+        "https://pan.baidu.com/s/1same 1234\n"
+        "https://pan.baidu.com/s/1same 1234\n"
+        "https://pan.baidu.com/s/1last 1234"
+    )
+    operation.root.var_custom_mode.value = False
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+    interrupt_before_second_item(operation)
+
+    operation.save()
+    saved_links = operation.saved_links.copy()
+    operation.save(resume=True)
+
+    assert saved_links <= operation.saved_links
+    assert paths == ["target", "target"]
+    assert operation.completed_task_count == 3
+    assert operation.resume_available is False
+
+
+@pytest.mark.parametrize("first_result", [None, -6, RuntimeError("token API unavailable")])
+def test_token_failure_can_be_resumed_after_cookie_is_updated(first_result):
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+
+    def token_failure():
+        if isinstance(first_result, Exception):
+            raise first_result
+        return first_result
+
+    operation.network.get_bdstoken = token_failure
+    operation.save()
+
+    assert operation.resume_available is True
+    assert operation.next_task_index == operation.completed_task_count == 0
+    assert operation.root.bottom_save.options["text"] == "继续转存"
+    operation.root.entry_cookie.value = "BAIDUID=new-cookie"
+    operation.network.get_bdstoken = lambda: "refreshed-token"
+
+    operation.save(resume=True)
+
+    assert operation.completed_task_count == 1
+    assert operation.network.headers["Cookie"] == "BAIDUID=new-cookie"
+    assert operation.resume_available is False
+
+
+def test_repeated_resume_failures_do_not_lose_the_checkpoint():
+    operation = make_save_operation(
+        "https://pan.baidu.com/s/1first 1234\n"
+        "https://pan.baidu.com/s/1second 1234"
+    )
+    interrupt_before_second_item(operation)
+    operation.save()
+    logs = operation.root.text_logs.value
+    operation.root.entry_cookie.value = "invalid cookie"
+
+    operation.save(resume=True)
+
+    assert operation.next_task_index == operation.completed_task_count == 1
+    assert operation.custom_dir_count == 1
+    assert operation.root.text_logs.value.startswith(logs)
+    assert operation.resume_available is True
+    assert operation.root.bottom_save.options["text"] == "继续转存"
+    operation.root.entry_cookie.value = "BAIDUID=updated"
+    operation.save(resume=True)
+
+    assert operation.completed_task_count == 2
+    assert operation.custom_dir_count == 2
+    assert operation.resume_available is False
+
+
+def test_progress_display_error_does_not_replay_a_completed_transfer():
+    operation = make_save_operation(
+        "https://pan.baidu.com/s/1first 1234\n"
+        "https://pan.baidu.com/s/1second 1234"
+    )
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+    label_config = operation.root.label_status.config
+
+    def fail_progress_once(**kwargs):
+        if kwargs.get("text") == "总进度：1/2":
+            operation.root.label_status.config = label_config
+            raise RuntimeError("progress display failed")
+        label_config(**kwargs)
+
+    operation.root.label_status.config = fail_progress_once
+    operation.save()
+
+    assert operation.next_task_index == operation.completed_task_count == 1
+    assert operation.resume_available is True
+    operation.save(resume=True)
+
+    assert paths == ["target/1", "target/2"]
+    assert operation.completed_task_count == 2
+
+
+def test_pause_button_continues_the_existing_worker_without_a_new_session():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    session = operation.network.s
+
+    operation.root.bottom_save.options["command"]()
+    assert operation.running is False
+    assert operation.root.bottom_save.options["text"] == "点击继续"
+    operation.root.bottom_save.options["command"]()
+
+    assert operation.running is True
+    assert operation.network.s is session
+    assert operation.next_task_index == 0
+
+
+def test_new_batch_resets_the_checkpoint_after_completion():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+    operation.save()
+    operation.root.text_links.value = "https://pan.baidu.com/s/1new 1234"
+
+    operation.save()
+
+    assert paths == ["target/1", "target/1"]
+    assert operation.next_task_index == operation.completed_task_count == 1
+    assert operation.custom_dir_count == 1
+    assert operation.root.text_logs.value.count("转存成功") == 1
+
+
+def test_resume_without_a_pending_batch_does_not_start_a_new_transfer():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    calls = []
+    operation.network.get_bdstoken = lambda: calls.append(True) or "token"
+
+    operation.save(resume=True)
+
+    assert calls == []
+    assert operation.root.text_logs.value == ""
+
+
+def test_initial_input_error_does_not_offer_resume_for_an_invalid_batch():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.root.entry_cookie.value = "invalid cookie"
+
+    operation.save()
+
+    assert operation.resume_available is False
+    assert operation.root.bottom_save.options["text"] == "批量转存"
+
+
+def test_duplicate_start_during_a_running_batch_is_ignored():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    calls = []
+
+    def get_token():
+        calls.append(True)
+        if len(calls) == 1:
+            operation.save()
+        return "token"
+
+    operation.network.get_bdstoken = get_token
+    operation.save()
+
+    assert calls == [True]
+    assert operation.completed_task_count == 1
+
+
+def test_duplicate_resume_during_a_running_batch_is_ignored():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.network.get_bdstoken = lambda: -6
+    operation.save()
+    calls = []
+
+    def get_token():
+        calls.append(True)
+        if len(calls) == 1:
+            operation.save(resume=True)
+        return "token"
+
+    operation.network.get_bdstoken = get_token
+    operation.save(resume=True)
+
+    assert calls == [True]
+    assert operation.completed_task_count == 1
+
+
+def test_sharing_cannot_clear_an_interrupted_save_checkpoint(monkeypatch):
+    operation = make_save_operation(
+        "https://pan.baidu.com/s/1first 1234\n"
+        "https://pan.baidu.com/s/1second 1234"
+    )
+    interrupt_before_second_item(operation)
+    operation.save()
+    logs = operation.root.text_logs.value
+
+    def unexpected_dialog(_root):
+        pytest.fail("Sharing must not start while a save checkpoint is pending")
+
+    monkeypatch.setattr("src.operations.CustomDialog", unexpected_dialog)
+    operation.share()
+
+    assert operation.next_task_index == operation.completed_task_count == 1
+    assert operation.root.text_logs.value == logs
+    assert operation.resume_available is True
+    operation.save(resume=True)
+    assert operation.completed_task_count == 2
+
+
+def test_resuming_a_directory_setup_failure_keeps_the_pending_tasks():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.network.get_dir_list = lambda *_args: -9
+    operation.network.create_dir = lambda *_args: -6
+    operation.save()
+
+    assert operation.resume_available is True
+    assert operation.next_task_index == 0
+    assert operation.custom_dir_count == 0
+    assert operation.created_dirs == set()
+    operation.network.get_dir_list = lambda *_args: []
+    operation.network.create_dir = lambda *_args: 0
+
+    operation.save(resume=True)
+
+    assert operation.completed_task_count == 1
+    assert operation.used_custom_dirs == {"target/1"}
+
+
+def test_finished_failures_and_titles_are_not_replayed_after_an_interruption():
+    operation = make_save_operation(
+        "unsupported title\n"
+        "https://pan.baidu.com/s/1failed 1234\n"
+        "https://pan.baidu.com/s/1pending 1234"
+    )
+    calls = []
+
+    def verify(url, _code):
+        calls.append(url)
+        return -4 if url.endswith("1failed") else VALID_RESULT
+
+    operation.verify_link = verify
+    process_save = operation.process_save
+    interrupted = False
+
+    def process(url_code, raw_link=""):
+        nonlocal interrupted
+        if operation.next_task_index == 2 and not interrupted:
+            interrupted = True
+            raise RuntimeError("batch interrupted")
+        process_save(url_code, raw_link)
+
+    operation.process_save = process
+    operation.save()
+
+    assert operation.next_task_index == operation.completed_task_count == 2
+    assert operation.custom_dir_count == 0
+    operation.save(resume=True)
+
+    assert calls == ["https://pan.baidu.com/s/1failed", "https://pan.baidu.com/s/1pending"]
+    assert operation.root.text_logs.value.count("不支持的链接") == 1
+    assert operation.used_custom_dirs == {"target/1"}
+    assert operation.completed_task_count == 3
 
 
 def test_large_batch_stays_aligned_after_duplicate_titles_and_links():

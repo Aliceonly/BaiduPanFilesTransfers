@@ -97,7 +97,7 @@ cd .\dist
 
 发布前至少检查以下内容：
 
-1. 主窗口能打开，输入框、选项和暂停/恢复操作正常。
+1. 主窗口能打开，输入框、选项和暂停/恢复操作正常；批次中断后显示「继续转存」，恢复时保留进度和目录编号。
 2. 「批量分享」设置弹窗能打开和关闭。
 3. 使用自己有权限的少量测试链接，验证普通转存、指定目录和检测模式；实际转存会修改网盘，请不要直接用重要数据验证。
 4. 在目标 Windows 机器上测试，最好包含一台未安装 Python 的机器。
@@ -144,7 +144,7 @@ Debug 版本是目录模式，移动或分发时必须保留整个 `dist\BaiduPa
 仓库内的 `.github/workflows/windows-release.yml` 提供远程 Windows 构建，macOS 用户无需安装本地 Windows VM 即可使用：
 
 - 手动构建：进入 GitHub 的 `Actions > Windows EXE Release > Run workflow`，选择分支并执行。成功后下载该 Run 的 `windows-x64-release` Artifact。手动执行只生成构建产物，不创建 Release。
-- 发布版本：更新 `src/constants.py` 的 `MAIN_VERSION`，准备对应的 `releases/v版本号.md`，提交并 push 后，再 push 同名 Tag，例如 `v2.8.3`。Tag 必须与代码中的版本一致。
+- 发布版本：更新 `src/constants.py` 的 `MAIN_VERSION`，准备对应的 `releases/v版本号.md`，提交并 push 后，再 push 同名 Tag，例如 `v2.8.4`。Tag 必须与代码中的版本一致。
 - Tag 构建通过回归测试、源码 GUI 检查和 `.exe` 主窗口启动检查后，workflow 才会创建 Release 并上传 `.exe`、ZIP、构建信息和 SHA-256 校验文件。构建失败时不会发布。
 
 每个 Release 的 `BUILD_INFO.txt` 记录源码 Commit 和实际安装的依赖版本。ZIP 只收集程序、许可、说明及构建信息，不会包含工作目录中的 Cookie 配置。

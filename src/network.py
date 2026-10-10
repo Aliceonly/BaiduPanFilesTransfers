@@ -39,6 +39,12 @@ class Network:
         # 忽略证书验证警告
         requests.packages.urllib3.disable_warnings()
 
+    def reset_session(self) -> None:
+        """恢复中断批次时重建 Session，丢弃旧会话 Cookie 和 bdstoken。"""
+        self.s.close()
+        self.s = requests.Session()
+        self.bdstoken = ''
+
     @retry(stop_max_attempt_number=3, wait_random_min=1000, wait_random_max=2000)
     def get_bdstoken(self) -> Union[str, int]:
         """

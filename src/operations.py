@@ -7,6 +7,7 @@
 """
 
 import sys
+import threading
 import time
 import traceback
 from typing import Union, List, Dict, Any
@@ -41,8 +42,16 @@ class Operations:
         self.created_dirs = set()
         self.used_custom_dirs = set()
         self.saved_links = set()
+        self.link_list = []
+        self.link_list_org = []
+        self.next_task_index = 0
+        self.completed_task_count = 0
+        self.total_task_count = 0
+        self.resume_available = False
+        self.running = False
+        self._run_lock = threading.Lock()
 
-    def save(self) -> None:
+    def save(self, resume: bool = False) -> None:
         """
         转存主函数，流程为：
         1.获取用户输入，更新按钮和标签状态；
@@ -50,19 +59,42 @@ class Operations:
         3.获取 bdstoken，如果获取失败则终止；
         4.获取根目录文件列表，建立转存目录；
         5.批量转存链接。先验证链接有效性，再转存文件，插入结果到日志框。
+
+        :param resume: 从内存中保留的断点继续，不重新读取链接或重置任务状态。
         """
+        if not self._run_lock.acquire(blocking=False):
+            return
+        if resume and not self.resume_available:
+            self._run_lock.release()
+            return
+        resume = resume or self.resume_available
+        can_resume = resume
         try:
-            self.prepare_run()
-            self.setup_save()
+            self.prepare_run(resume=resume)
+            if not resume:
+                self.setup_save()
             self.handle_input()
+            can_resume = True
             self.handle_bdstoken()
             self.handle_create_dir(folder_name=self.folder_name)
+            if resume:
+                self.insert_logs(f'继续转存：已处理 {self.next_task_index}/{self.total_task_count}，从下一条未处理输入继续。')
+                self.change_status('running')
             self.handle_process_save()
+        except SystemExit:
+            # check_condition has already logged the input or API error.
+            pass
         except Exception as e:
             self.insert_logs(f'程序出现未预料错误，信息如下：\n{e}\n{traceback.format_exc()}')
         finally:
-            self.network.s.close()
-            self.change_status('stopped')
+            self.resume_available = can_resume and self.next_task_index < len(self.link_list)
+            try:
+                try:
+                    self.network.s.close()
+                finally:
+                    self.change_status('interrupted' if self.resume_available else 'stopped')
+            finally:
+                self._run_lock.release()
 
     def share(self) -> None:
         """
@@ -74,6 +106,11 @@ class Operations:
         4.获取目标目录文件列表，如果为空则终止；
         5.批量分享文件。先向链接框插入文件名，再创建分享，插入结果到日志框。
         """
+        if not self._run_lock.acquire(blocking=False):
+            return
+        if self.resume_available:
+            self._run_lock.release()
+            return
         try:
             # 创建对话框实例，如果对话框没有返回输入值，则忽略
             self.dialog_result = CustomDialog(self.root)
@@ -87,26 +124,38 @@ class Operations:
         except Exception as e:
             self.insert_logs(f'程序出现未预料错误，信息如下：\n{e}\n{traceback.format_exc()}')
         finally:
-            self.network.s.close()
-            self.change_status('stopped')
+            try:
+                try:
+                    self.network.s.close()
+                finally:
+                    self.change_status('stopped')
+            finally:
+                self._run_lock.release()
 
-    def prepare_run(self) -> None:
+    def prepare_run(self, resume: bool = False) -> None:
         """获取变量，准备运行。转存和分享共用逻辑"""
         # 从用户输入获取变量
         self.cookie = "".join(self.root.entry_cookie.get().split())
-        self.folder_name = "".join(self.root.entry_folder_name.get().split()).strip('/')
+        if resume:
+            self.network.reset_session()
+        else:
+            self.folder_name = "".join(self.root.entry_folder_name.get().split()).strip('/')
+            self.custom_mode = self.root.var_custom_mode.get()
+            self.check_mode = self.root.var_check_mode.get()
+            self.completed_task_count = 0
+            self.custom_dir_count = 0
+            self.created_dirs = set()
+            self.used_custom_dirs = set()
+            self.saved_links = set()
+            self.link_list = []
+            self.link_list_org = []
+            self.next_task_index = 0
+            self.resume_available = False
         self.network.s.trust_env = self.root.var_trust_env.get()
-        self.custom_mode = self.root.var_custom_mode.get()
-        self.check_mode = self.root.var_check_mode.get()
 
-        # 更新 cookie、初始化任务总数、更改状态、写入配置文件
-        self.completed_task_count = 0
-        self.custom_dir_count = 0
-        self.created_dirs = set()
-        self.used_custom_dirs = set()
-        self.saved_links = set()
+        # Keep the original batch's paths, modes and logs when resuming.
         self.network.headers['Cookie'] = self.cookie
-        self.change_status('init')
+        self.change_status('resuming' if resume else 'init')
         write_config(f'{self.cookie}\n{self.folder_name}')
 
     def setup_save(self) -> None:
@@ -196,8 +245,15 @@ class Operations:
 
     def handle_process_save(self) -> None:
         """执行批量转存"""
-        for url_code, raw_link in zip(self.link_list, self.link_list_org):
+        while self.next_task_index < len(self.link_list):
+            task_index = self.next_task_index
+            url_code = self.link_list[task_index]
+            raw_link = self.link_list_org[task_index]
             self.process_save(url_code, raw_link)
+            # Commit the checkpoint before updating UI, which can also fail.
+            self.next_task_index = task_index + 1
+            self.completed_task_count = self.next_task_index
+            self.change_status('progress')
 
     def handle_process_share(self) -> None:
         """执行批量分享"""
@@ -216,9 +272,6 @@ class Operations:
         except Exception as e:
             # A malformed response must only fail this item, not the whole batch.
             self.insert_logs(f'转存时发生未预料错误：{e}：{url_code}')
-        finally:
-            # 处理完毕一个链接，更新状态栏任务计数
-            self.change_status('update')
 
     def process_share(self, info: Dict[str, Any]) -> None:
         """执行分享操作并记录结果"""
@@ -250,16 +303,29 @@ class Operations:
             self.root.label_status.unbind("<Button-1>")
             self.root.text_logs.config(fg=COLOR_MAP['text'])
             self.root.text_logs.delete(1.0, 'end')
+            self.root.bottom_share.config(state="disabled")
+            self.root.bottom_save.config(state="disabled")
+        elif status == 'resuming':
+            self.root.label_status.config(text=f'正在恢复：{self.completed_task_count}/{self.total_task_count}', bootstyle='warning')
+            self.root.bottom_share.config(state="disabled")
+            self.root.bottom_save.config(state="disabled")
         elif status == 'running':
             self.running = True
             self.root.bottom_share.config(state="disabled")
-            self.root.bottom_save.config(text='点击暂停', bootstyle='danger', command=lambda: self.change_status('paused'))
+            self.root.bottom_save.config(text='点击暂停', state="normal", bootstyle='danger', command=lambda: self.change_status('paused'))
         elif status == 'paused':
             self.running = False
             self.root.bottom_save.config(text='点击继续', bootstyle='success', command=lambda: self.change_status('running'))
         elif status == 'update':
             self.completed_task_count += 1
+            self.change_status('progress')
+        elif status == 'progress':
             self.root.label_status.config(text=f'总进度：{self.completed_task_count}/{self.total_task_count}', bootstyle='success')
+        elif status == 'interrupted':
+            self.running = False
+            self.root.label_status.config(text=f'程序中断，可继续转存：{self.completed_task_count}/{self.total_task_count}', bootstyle='warning')
+            self.root.bottom_save.config(text='继续转存', state="normal", bootstyle='warning', command=lambda: thread_it(self.save, True))
+            self.root.bottom_share.config(state="disabled")
         elif status == 'sharing':
             self.root.text_links.delete(1.0, 'end')
             self.root.bottom_share.config(state="disabled")

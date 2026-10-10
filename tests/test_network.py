@@ -162,6 +162,25 @@ def test_network_instances_do_not_share_cookie_headers():
     assert "Cookie" not in second.headers
 
 
+def test_reset_session_discards_session_cookies_and_token(monkeypatch):
+    network = Network()
+    old_session = network.s
+    closed = []
+    monkeypatch.setattr(old_session, "close", lambda: closed.append(True))
+    old_session.cookies.set("old-share-cookie", "expired")
+    network.bdstoken = "expired-token"
+    network.headers["Cookie"] = "BAIDUID=current"
+
+    network.reset_session()
+
+    assert closed == [True]
+    assert network.s is not old_session
+    assert not network.s.cookies
+    assert network.bdstoken == ""
+    assert network.headers["Cookie"] == "BAIDUID=current"
+    network.s.close()
+
+
 def test_parse_response_deduplicates_embedded_file_records():
     record = '{"fs_id":3,"isdir":0,"server_filename":"one"}'
     response = f'{{"shareid":1,"share_uk":"2","list":[{record},{record}]}}'
