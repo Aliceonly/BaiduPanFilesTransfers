@@ -8,9 +8,11 @@
 
 ## 下载及运行
 
-原版程序开发编译环境为 `Win10 x64` 专业版。以下是原作者的历史下载渠道，不一定包含本仓库新增的修复。要使用本仓库的最新代码，请按 [Windows EXE 打包指南](docs/BUILD_WINDOWS.md) 自行打包，或配置 Python 环境运行源码。当前打包说明以 Windows 10/11 x64 为目标，不保证 Windows 7 兼容性。
+本仓库通过 GitHub Actions 的 Windows runner 构建 Windows x64 程序。到 [本仓库的 Release 页面](https://github.com/Aliceonly/BaiduPanFilesTransfers/releases/latest) 下载 `BaiduPanFilesTransfers.exe`，或下载 `BaiduPanFilesTransfers-windows-x64.zip` 后解压运行，无需安装 Python。Release 同时提供 SHA-256 校验值和构建信息，不包含个人 Cookie 配置。
 
-下载方式：
+如果需要自行构建，请按 [Windows EXE 打包指南](docs/BUILD_WINDOWS.md) 操作。当前打包说明以 Windows 10/11 x64 为目标，不保证 Windows 7 兼容性。
+
+原作者的历史下载渠道（不一定包含本仓库新增的修复）：
 
 - 方式一：到 [release](https://github.com/hxz393/BaiduPanFilesTransfers/releases) 页面下载最新版的 `exe` 文件，文件名为 `BaiduPanFilesTransfers.exe`，下完可直接打开使用。
 - 方式二：到 [百度网盘](https://pan.baidu.com/s/1RK7uBqaqgqJHLJbadXI48g?pwd=6666) 下载对应压缩包 `BaiduPanFilesTransfers.zip`，下完后请解压缩再使用。

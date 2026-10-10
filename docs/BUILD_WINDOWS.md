@@ -18,7 +18,7 @@
 py -3.12 --version
 ```
 
-如果安装的是其他兼容版本，需要同步替换下文中的 `-3.12`。本文使用 Python 3.12 作为示例，不代表已完成该版本的 Windows 打包验证。
+如果安装的是其他兼容版本，需要同步替换下文中的 `-3.12`。本仓库的 Release workflow 同样使用 Python 3.12 x64，在 Windows runner 上完成构建和启动检查；目标电脑上的实际网盘操作仍需自行验证。
 
 ## 2. 获取包含修复的源码
 
@@ -138,6 +138,18 @@ Debug 版本是目录模式，移动或分发时必须保留整个 `dist\BaiduPa
 | 想在 macOS/Linux 生成 Windows `.exe` | 改在 Windows 主机或 Windows VM 中构建；PyInstaller 不提供跨操作系统编译。 |
 
 不要将 Windows x64 的构建产物直接视为其他 architecture 或旧版 Windows 的兼容产物；不同目标环境需要单独构建和验证。
+
+## 8. 使用 GitHub Actions 自动发布
+
+仓库内的 `.github/workflows/windows-release.yml` 提供远程 Windows 构建，macOS 用户无需安装本地 Windows VM 即可使用：
+
+- 手动构建：进入 GitHub 的 `Actions > Windows EXE Release > Run workflow`，选择分支并执行。成功后下载该 Run 的 `windows-x64-release` Artifact。手动执行只生成构建产物，不创建 Release。
+- 发布版本：更新 `src/constants.py` 的 `MAIN_VERSION`，准备对应的 `releases/v版本号.md`，提交并 push 后，再 push 同名 Tag，例如 `v2.8.3`。Tag 必须与代码中的版本一致。
+- Tag 构建通过回归测试、源码 GUI 检查和 `.exe` 主窗口启动检查后，workflow 才会创建 Release 并上传 `.exe`、ZIP、构建信息和 SHA-256 校验文件。构建失败时不会发布。
+
+每个 Release 的 `BUILD_INFO.txt` 记录源码 Commit 和实际安装的依赖版本。ZIP 只收集程序、许可、说明及构建信息，不会包含工作目录中的 Cookie 配置。
+
+发布需要启用 GitHub Actions，并允许 workflow 使用 `contents: write`；无需另行提供 Personal Access Token。自动检查不登录百度网盘，也不执行真实转存。
 
 ## 官方参考
 
