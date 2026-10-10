@@ -7,9 +7,6 @@ import pytest
 try:
     import tkinter
 except ImportError:
-    ttk = types.ModuleType("ttkbootstrap")
-    ttk.END = "end"
-    sys.modules["ttkbootstrap"] = ttk
     ui = types.ModuleType("src.ui")
     ui.CustomDialog = object
     sys.modules["src.ui"] = ui

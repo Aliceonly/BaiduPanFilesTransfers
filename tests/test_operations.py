@@ -19,8 +19,8 @@ class DummyText:
     def insert(self, _position, value):
         self.value += value
 
-    def see(self, *_args):
-        pass
+    def see(self, position):
+        assert position == "end"
 
     def delete(self, *_args):
         self.value = ""

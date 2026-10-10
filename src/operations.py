@@ -11,8 +11,6 @@ import time
 import traceback
 from typing import Union, List, Dict, Any
 
-import ttkbootstrap as ttk
-
 from src.constants import EXP_MAP, DELAY_SECONDS, INVALID_CHARS, ERROR_CODES, SAVE_LIMIT, COLOR_MAP
 from src.network import Network
 from src.ui import CustomDialog
@@ -115,7 +113,7 @@ class Operations:
         """准备链接，更新状态"""
         # 从文本链接控件获取全部链接，清洗并标准化链接。注意链接后拼接一个空格，是为了后面能统一处理带与不带提取码的链接
         raw_links = [
-            link for link in self.root.text_links.get(1.0, ttk.END).splitlines()
+            link for link in self.root.text_links.get(1.0, 'end').splitlines()
             if link.strip()
         ]
         self.link_list = [normalize_link(f'{link} ') for link in raw_links]
@@ -251,7 +249,7 @@ class Operations:
             self.root.label_status.config(text='准备就绪！', font=('', 10), bootstyle='primary', cursor="arrow")
             self.root.label_status.unbind("<Button-1>")
             self.root.text_logs.config(fg=COLOR_MAP['text'])
-            self.root.text_logs.delete(1.0, ttk.END)
+            self.root.text_logs.delete(1.0, 'end')
         elif status == 'running':
             self.running = True
             self.root.bottom_share.config(state="disabled")
@@ -263,7 +261,7 @@ class Operations:
             self.completed_task_count += 1
             self.root.label_status.config(text=f'总进度：{self.completed_task_count}/{self.total_task_count}', bootstyle='success')
         elif status == 'sharing':
-            self.root.text_links.delete(1.0, ttk.END)
+            self.root.text_links.delete(1.0, 'end')
             self.root.bottom_share.config(state="disabled")
             self.root.bottom_save.config(state="disabled")
         elif status == 'error':
@@ -296,7 +294,7 @@ class Operations:
         """
         text_box = self.root.text_links if alt else self.root.text_logs
         text_box.insert('end', f'{message}\n')
-        text_box.see(ttk.END)
+        text_box.see('end')
 
     def pause_detection(self, url_code: str, raw_link: str = '') -> None:
         """循环检测暂停逻辑，每个转存任务开始时都会检测"""
