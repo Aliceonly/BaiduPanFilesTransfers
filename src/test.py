@@ -76,7 +76,7 @@ def test_parse_url_and_code(url_code, expected):
     # 测试没有任何参数的情况
     ('"some_other_data":100,"another_field":200,"', -1),
     # 测试包含额外字符的情况
-    ('some random data "shareid":12345,"share_uk":"67890","fs_id":111,""more random data "code":---091,"fs_id":222,"isdir":1,"server_filename":"海岸"," end of response', ["12345", "67890", ["111", "222"], ['海岸'], ['1']]),
+    ('some random data "shareid":12345,"share_uk":"67890","fs_id":111,""more random data "code":---091,"fs_id":222,"isdir":1,"server_filename":"海岸"," end of response', -1),
     # 测试空字符串的情况
     ('', -1)
 ])
@@ -93,4 +93,8 @@ def test_parse_response(response, expected):
     ("anotherBDCLND", "110085_287281_287977", "ValueError")
 ])
 def test_update_cookie(bdclnd, cookie, expected):
-    assert update_cookie(bdclnd, cookie) == expected
+    if expected == "ValueError":
+        with pytest.raises(ValueError):
+            update_cookie(bdclnd, cookie)
+    else:
+        assert update_cookie(bdclnd, cookie) == expected

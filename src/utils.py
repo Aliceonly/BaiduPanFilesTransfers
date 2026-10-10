@@ -7,6 +7,7 @@
 """
 import atexit
 import base64
+import json
 import os
 import random
 import re
@@ -19,11 +20,11 @@ from typing import Any, Union, Tuple, Callable, List, Optional
 from src.constants import CONFIG_PATH, ICON_BASE64
 
 # 预编译正则表达式
-SHARE_ID_REGEX = re.compile(r'"shareid":(\d+?),"')
-USER_ID_REGEX = re.compile(r'"share_uk":"(\d+?)","')
-FS_ID_REGEX = re.compile(r'"fs_id":(\d+?),"')
-SERVER_FILENAME_REGEX = re.compile(r'"server_filename":"(.+?)","')
-ISDIR_REGEX = re.compile(r'"isdir":(\d+?),"')
+SHARE_ID_REGEX = re.compile(r'"shareid"\s*:\s*"?(\d+)"?\s*[,}]')
+USER_ID_REGEX = re.compile(r'"share_uk"\s*:\s*"?(\d+)"?\s*[,}]')
+FS_ID_REGEX = re.compile(r'"fs_id"\s*:\s*"?(\d+)"?\s*[,}]')
+SERVER_FILENAME_REGEX = re.compile(r'"server_filename"\s*:\s*("(?:[^"\\]|\\.)*")\s*[,}]')
+ISDIR_REGEX = re.compile(r'"isdir"\s*:\s*([01])\s*[,}]')
 
 
 def thread_it(func: Callable, *args: Tuple[Any, ...]) -> None:
@@ -106,29 +107,75 @@ def parse_url_and_code(url_code: str) -> Tuple[str, str]:
     :param url_code: 输入的标准链接格式
     :return: 链接和提取码
     """
-    # 不会分割失败
-    url, code = map(str.strip, url_code.split(' ', 1))
+    url, _, code = url_code.partition(' ')
+    url, code = url.strip(), code.strip()
     # 暴力切片，如果输入链接不是以提取码结尾，会得到错误提取码
     return url[:47], code[-4:]
 
 
-def parse_response(response: str) -> Union[List[str], int]:
+def parse_response(response: str) -> Union[List[Any], int]:
     """
     验证提取码通过后，再次访问网盘地址，此函数解析返回的页面源码并提取所需要参数。
     shareid_list 和 user_id_list 只有一个值，fs_id_list 需要完整返回
 
     :param response: 响应内容
-    :return: 没有获取到足够参数时，返回错误代码 -1；否则返回三个参数的列表
+    :return: 没有获取到足够参数时返回 -1，否则返回完整转存参数及文件信息
     """
+    if not isinstance(response, str):
+        return -1
+
     shareid_list = SHARE_ID_REGEX.findall(response)
     user_id_list = USER_ID_REGEX.findall(response)
     fs_id_list = FS_ID_REGEX.findall(response)
     server_filename_list = SERVER_FILENAME_REGEX.findall(response)
     isdir_list = ISDIR_REGEX.findall(response)
-    if not all([shareid_list, user_id_list, fs_id_list, server_filename_list, isdir_list]):
+    if (
+        not all([shareid_list, user_id_list, fs_id_list, server_filename_list, isdir_list])
+        or len(fs_id_list) != len(server_filename_list)
+        or len(fs_id_list) != len(isdir_list)
+    ):
         return -1
 
-    return [shareid_list[0], user_id_list[0], fs_id_list, list(dict.fromkeys(server_filename_list)), isdir_list]
+    files = {}
+    try:
+        for fs_id, filename, isdir in zip(fs_id_list, server_filename_list, isdir_list):
+            # A page can embed a file list twice; send each fs_id only once.
+            files.setdefault(fs_id, (json.loads(filename), isdir))
+    except (ValueError, TypeError):
+        return -1
+
+    params = [
+        shareid_list[0], user_id_list[0], list(files),
+        [info[0] for info in files.values()], [info[1] for info in files.values()],
+    ]
+    return params if is_valid_transfer_params(params) else -1
+
+
+def is_valid_transfer_params(params: Any) -> bool:
+    """
+    Check that transfer parameters contain one complete entry per shared file.
+
+    :param params: Parsed transfer parameters
+    :return: True when the structure is safe for transfer and display
+    """
+    if not isinstance(params, list) or len(params) != 5:
+        return False
+
+    share_id, user_id, fs_id_list, filename_list, isdir_list = params
+    return (
+        isinstance(share_id, str)
+        and isinstance(user_id, str)
+        and bool(share_id)
+        and bool(user_id)
+        and isinstance(fs_id_list, list)
+        and isinstance(filename_list, list)
+        and isinstance(isdir_list, list)
+        and bool(fs_id_list)
+        and len(fs_id_list) == len(filename_list) == len(isdir_list)
+        and all(isinstance(fs_id, str) and fs_id.isascii() and fs_id.isdigit() for fs_id in fs_id_list)
+        and all(isinstance(filename, str) and filename for filename in filename_list)
+        and all(isdir in ('0', '1') for isdir in isdir_list)
+    )
 
 
 def update_cookie(bdclnd: str, cookie: str) -> str:

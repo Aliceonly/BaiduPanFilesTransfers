@@ -16,7 +16,16 @@ import ttkbootstrap as ttk
 from src.constants import EXP_MAP, DELAY_SECONDS, INVALID_CHARS, ERROR_CODES, SAVE_LIMIT, COLOR_MAP
 from src.network import Network
 from src.ui import CustomDialog
-from src.utils import thread_it, write_config, parse_response, normalize_link, parse_url_and_code, update_cookie, generate_code
+from src.utils import (
+    thread_it,
+    write_config,
+    parse_response,
+    normalize_link,
+    parse_url_and_code,
+    update_cookie,
+    generate_code,
+    is_valid_transfer_params,
+)
 
 
 class Operations:
@@ -30,6 +39,10 @@ class Operations:
     def __init__(self, root):
         self.root = root
         self.network = Network()
+        self.custom_dir_count = 0
+        self.created_dirs = set()
+        self.used_custom_dirs = set()
+        self.saved_links = set()
 
     def save(self) -> None:
         """
@@ -83,13 +96,17 @@ class Operations:
         """获取变量，准备运行。转存和分享共用逻辑"""
         # 从用户输入获取变量
         self.cookie = "".join(self.root.entry_cookie.get().split())
-        self.folder_name = "".join(self.root.entry_folder_name.get().split())
+        self.folder_name = "".join(self.root.entry_folder_name.get().split()).strip('/')
         self.network.s.trust_env = self.root.var_trust_env.get()
         self.custom_mode = self.root.var_custom_mode.get()
         self.check_mode = self.root.var_check_mode.get()
 
         # 更新 cookie、初始化任务总数、更改状态、写入配置文件
         self.completed_task_count = 0
+        self.custom_dir_count = 0
+        self.created_dirs = set()
+        self.used_custom_dirs = set()
+        self.saved_links = set()
         self.network.headers['Cookie'] = self.cookie
         self.change_status('init')
         write_config(f'{self.cookie}\n{self.folder_name}')
@@ -97,9 +114,13 @@ class Operations:
     def setup_save(self) -> None:
         """准备链接，更新状态"""
         # 从文本链接控件获取全部链接，清洗并标准化链接。注意链接后拼接一个空格，是为了后面能统一处理带与不带提取码的链接
-        raw_links = self.root.text_links.get(1.0, ttk.END).splitlines()
-        self.link_list = [normalize_link(f'{link} ') for link in raw_links if link]
-        self.link_list_org = list(dict.fromkeys(link for link in raw_links if link))
+        raw_links = [
+            link for link in self.root.text_links.get(1.0, ttk.END).splitlines()
+            if link.strip()
+        ]
+        self.link_list = [normalize_link(f'{link} ') for link in raw_links]
+        # Keep the raw and normalized rows aligned. Duplicate rows are valid input.
+        self.link_list_org = raw_links
         # 更新任务总数和状态
         self.total_task_count = len(self.link_list)
         self.change_status('running')
@@ -127,11 +148,13 @@ class Operations:
         # 非法字符由官方规定的。符号 / 可以使用，作为子目录的分隔符
         self.check_condition(any(char in self.folder_name for char in INVALID_CHARS),
                              message=r'转存目录名有非法字符，不能包含：< > | * ? \ :')
+        if task_count_check and self.custom_mode and not self.check_mode:
+            self.check_condition(not self.folder_name, message='必须输入转存目录')
 
     def handle_bdstoken(self) -> None:
         """获取 bdstoken 相关逻辑"""
         self.network.bdstoken = self.network.get_bdstoken()
-        self.check_condition(isinstance(self.network.bdstoken, int),
+        self.check_condition(not isinstance(self.network.bdstoken, str) or not self.network.bdstoken,
                              message=f'没获取到 bdstoken 参数，错误代码：{self.network.bdstoken}')
 
     def handle_list_dir(self) -> None:
@@ -140,36 +163,64 @@ class Operations:
         self.check_condition(isinstance(self.dir_list_all, int) or not self.dir_list_all,
                              message=f'目录 {self.folder_name} 中没获取到任何内容，请求返回：{self.dir_list_all}')
 
-    def handle_create_dir(self, folder_name: str) -> None:
-        """新建目录。如果目录已存在则不新建，否则会建立一个带时间戳的空目录"""
-        result = self.network.get_dir_list(f'/{folder_name}')
-        # 如果 result 为错误代码数字，代表目标目录不存在
-        if self.folder_name and isinstance(result, int):
+    def handle_create_dir(self, folder_name: str, require_empty: bool = False) -> bool:
+        """确保目录存在；指定目录必须为空且尚未被本轮任务占用。"""
+        if require_empty and folder_name in self.used_custom_dirs:
+            return False
+        if not require_empty and folder_name in self.created_dirs:
+            return True
+
+        if require_empty:
+            # New custom directories need only one request. An existing path
+            # is checked below before the caller selects another name.
             return_code = self.network.create_dir(folder_name)
-            self.check_condition(return_code != 0,
-                                 message=f'创建目录失败，错误代码：{return_code}')
+            if return_code == 0:
+                self.created_dirs.add(folder_name)
+                return True
+            if return_code not in (-8, 4):
+                raise RuntimeError(f'创建目录失败，错误代码：{return_code}')
+
+        result = self.network.get_dir_list(f'/{folder_name}')
+        if require_empty:
+            if not isinstance(result, list):
+                raise RuntimeError(f'无法检查目录 {folder_name}，请求返回：{result}')
+            return not result
+
+        # 如果 result 为错误代码数字，代表目标目录不存在
+        if folder_name and isinstance(result, int):
+            return_code = self.network.create_dir(folder_name)
+            if return_code not in (0, -8, 4):
+                raise RuntimeError(f'创建目录失败，错误代码：{return_code}')
+        elif not isinstance(result, list):
+            raise RuntimeError(f'无法检查目录 {folder_name}，请求返回：{result}')
+        self.created_dirs.add(folder_name)
+        return True
 
     def handle_process_save(self) -> None:
         """执行批量转存"""
-        for url_code in self.link_list:
-            self.process_save(url_code)
+        for url_code, raw_link in zip(self.link_list, self.link_list_org):
+            self.process_save(url_code, raw_link)
 
     def handle_process_share(self) -> None:
         """执行批量分享"""
         for info in self.dir_list_all:
             self.process_share(info)
 
-    def process_save(self, url_code: str) -> None:
+    def process_save(self, url_code: str, raw_link: str = '') -> None:
         """执行转存操作并记录结果"""
-        # 跳过非网盘链接
-        if 'https://pan.baidu.com/' not in url_code:
-            self.insert_logs(f'不支持的链接：{url_code}')
-        else:
-            # 执行转存过程，通过简单的循环判断是否要暂停
-            self.pause_detection(url_code)
-
-        # 处理完毕一个链接，更新状态栏任务计数
-        self.change_status('update')
+        try:
+            # 跳过非网盘链接
+            if 'https://pan.baidu.com/' not in url_code:
+                self.insert_logs(f'不支持的链接：{url_code}')
+            else:
+                # 执行转存过程，通过简单的循环判断是否要暂停
+                self.pause_detection(url_code, raw_link)
+        except Exception as e:
+            # A malformed response must only fail this item, not the whole batch.
+            self.insert_logs(f'转存时发生未预料错误：{e}：{url_code}')
+        finally:
+            # 处理完毕一个链接，更新状态栏任务计数
+            self.change_status('update')
 
     def process_share(self, info: Dict[str, Any]) -> None:
         """执行分享操作并记录结果"""
@@ -247,28 +298,29 @@ class Operations:
         text_box.insert('end', f'{message}\n')
         text_box.see(ttk.END)
 
-    def pause_detection(self, url_code: str) -> None:
+    def pause_detection(self, url_code: str, raw_link: str = '') -> None:
         """循环检测暂停逻辑，每个转存任务开始时都会检测"""
         # 只要 self.running 状态没变，会一直等待。而状态变化由用户点击按钮控制
         while not self.running:
             time.sleep(DELAY_SECONDS)
 
         # 执行验证链接和转存文件
-        self.verify_and_save(url_code)
-        # 转存完毕等待一小段时间。如果要转存超过 1000 个链接，可以增加 DELAY_SECONDS 到 3 以上。
-        time.sleep(DELAY_SECONDS)
+        self.verify_and_save(url_code, raw_link)
 
-    def verify_and_save(self, url_code: str) -> None:
+    def verify_and_save(self, url_code: str, raw_link: str = '') -> None:
         """验证链接和转存文件"""
+        if not self.check_mode and not self.custom_mode and url_code in self.saved_links:
+            self.save_file(4, url_code, self.folder_name, raw_link)
+            return
         # 验证链接是否有效，返回的数字为错误代码，反之返回参数列表
         result = self.verify_link(*parse_url_and_code(url_code))
         # 如果开启检查模式，插入检查结果，然后结束
         if self.check_mode:
             self.check_only(result, url_code)
         else:
-            self.save_file(result, url_code, self.folder_name)
+            self.save_file(result, url_code, self.folder_name, raw_link)
 
-    def verify_link(self, url: str, password: str) -> Union[List[str], int]:
+    def verify_link(self, url: str, password: str) -> Union[List[Any], int]:
         """验证链接有效性，验证通过返回转存所需参数列表"""
         # 对于有提取码的链接先验证提取码，试图获取更新 bdclnd
         if password:
@@ -276,6 +328,8 @@ class Operations:
             # 如果 bdclnd 是错误代码，直接返回
             if isinstance(bdclnd, int):
                 return bdclnd
+            if not isinstance(bdclnd, str) or not bdclnd:
+                return -1
 
             # 更新 bdclnd 到 cookie
             self.network.headers['Cookie'] = update_cookie(bdclnd, self.network.headers['Cookie'])
@@ -285,43 +339,90 @@ class Operations:
         # 这里不考虑网络异常了，假设请求一定会返回页面内容，对其进行解析
         return parse_response(response)
 
-    def check_only(self, result: Union[List[str], int], url_code: str) -> None:
+    def check_only(self, result: Union[List[Any], int], url_code: str) -> None:
         """开启检查模式时，只管判断返回值类型，并输出结果到日志"""
-        if isinstance(result, list):
-            self.insert_logs(f'链接有效：{url_code} {"目录" if result[4] == ["1"] else "文件"}：{result[3]}')
+        if is_valid_transfer_params(result):
+            file_type = "目录" if result[4] == ["1"] else "文件"
+            self.insert_logs(f'链接有效：{url_code} {file_type}：{result[3]}')
         else:
-            self.insert_logs(f'链接无效：{url_code} 原因：{ERROR_CODES.get(result, f"错误代码（{result}）")}')
+            error_code = result if isinstance(result, int) else -1
+            self.insert_logs(f'链接无效：{url_code} 原因：{ERROR_CODES.get(error_code, f"错误代码（{error_code}）")}')
 
-    def creat_user_dir(self, folder_name: str) -> str:
-        """建立用户指定目录，返回完整路径。目录名从原始输入取，函数为 custom_mode 专用"""
-        self.check_condition(not folder_name, message='必须输入转存目录')
+    def creat_user_dir(self, folder_name: str, raw_link: str, directory_number: int) -> str:
+        """按当前链接创建空目录，不依赖输入行数或其他行的标题。"""
+        if not folder_name:
+            raise ValueError('必须输入转存目录')
         # 对原始输入进行分割
-        link_org_sep = self.link_list_org[self.completed_task_count].split()
-        # 建立自定义目录，如果没有指定则用行数代替
-        custom_folder = link_org_sep[0]
-        folder_name = f'{folder_name}/{custom_folder}' if 'pan.baidu.com' not in custom_folder else f'{folder_name}/{self.completed_task_count + 1}'
+        link_org_sep = raw_link.split()
+        # Explicit directory prefixes are preserved; bare URLs use a link counter.
+        custom_folder = link_org_sep[0] if link_org_sep else ''
+        numeric_name = not custom_folder or 'pan.baidu.com' in custom_folder
+        custom_folder = str(directory_number) if numeric_name else custom_folder
+        folder_name = f'{folder_name}/{custom_folder}'
         # 此处用替换处理目标目录名非法字符，不报错了
         folder_name = folder_name.translate(str.maketrans({char: '_' for char in INVALID_CHARS}))
-        self.handle_create_dir(folder_name)
 
-        return folder_name
+        base_path = folder_name
+        for offset in range(SAVE_LIMIT):
+            if offset:
+                folder_name = (
+                    f'{base_path.rsplit("/", 1)[0]}/{directory_number + offset}'
+                    if numeric_name else f'{base_path}_{offset + 1}'
+                )
+            if self.handle_create_dir(folder_name, require_empty=True):
+                self.used_custom_dirs.add(folder_name)
+                if numeric_name:
+                    self.custom_dir_count = directory_number + offset
+                return folder_name
+        raise RuntimeError(f'无法为当前链接创建空目录：{base_path}')
 
-    def save_file(self, result: Union[List[str], int], url_code: str, folder_name: str) -> None:
-        """转存文件。返回结果为列表时，执行转存文件，否则跳过转存"""
+    def save_file(
+        self,
+        result: Union[List[Any], int],
+        url_code: str,
+        folder_name: str,
+        raw_link: str = '',
+    ) -> None:
+        """转存文件。返回结果为列表时，执行转存文件，否则跳过转存。"""
         file_info = ""
-        if isinstance(result, list):
-            file_info = f'{"目录" if result[4] == ["1"] else "文件"}：{result[3]}'
-            # 如果开启安全转存模式，对每个转存链接建立目录
+        if is_valid_transfer_params(result):
+            filenames = ', '.join(result[3])
+            file_info = f'{"目录" if result[4] == ["1"] else "文件"}：{filenames}'
             if self.custom_mode:
-                folder_name = self.creat_user_dir(folder_name)
-                result = self.network.transfer_file(result, folder_name)
+                self.custom_dir_count += 1
+                transfer_params = result
+                folder_name = self.creat_user_dir(
+                    folder_name, raw_link or url_code, self.custom_dir_count
+                )
+                result = self.transfer_with_logs(transfer_params, folder_name, url_code)
+                if result in (-8, 4):
+                    # A previous request or another client may have populated
+                    # the path. Use a fresh empty directory once.
+                    self.insert_logs(f'目录存在同名文件，改用新的空目录重试：{folder_name}')
+                    self.custom_dir_count += 1
+                    folder_name = self.creat_user_dir(
+                        self.folder_name, raw_link or url_code, self.custom_dir_count
+                    )
+                    result = self.transfer_with_logs(transfer_params, folder_name, url_code)
                 file_info = f'{file_info} 转存到：{folder_name}'
-            # 改在这里检查链接重复，在日志中查找。链接有出现过不转存，直接赋值结果为错误代码 4
-            elif url_code in self.root.text_logs.get('1.0', 'end'):
+            elif url_code in self.saved_links:
                 result = 4
-            # 正常转存
             else:
-                result = self.network.transfer_file(result, folder_name)
+                result = self.transfer_with_logs(result, folder_name, url_code)
+                if result == 0:
+                    self.saved_links.add(url_code)
+        else:
+            result = result if isinstance(result, int) else -1
+
+        if not isinstance(result, int):
+            result = -1
 
         # 最后插入转存结果到日志框
         self.insert_logs(f'{ERROR_CODES.get(result, f"转存失败，错误代码（{result}）")}：{url_code} {file_info}')
+
+    def transfer_with_logs(self, params: List[Any], folder_name: str, url_code: str) -> int:
+        """记录每次重试；重试期间使用相同的链接与目录。"""
+        def on_retry(attempt, reason):
+            self.insert_logs(f'转存失败（{reason}），正在第 {attempt} 次尝试：{url_code}')
+
+        return self.network.transfer_file(params, folder_name, on_retry=on_retry)

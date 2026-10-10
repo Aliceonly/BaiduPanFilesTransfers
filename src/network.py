@@ -5,19 +5,27 @@
 :contact: https://github.com/hxz393
 :copyright: Copyright 2024, hxz393. 保留所有权利。
 """
+import random
 import time
-from typing import Union, List, Any
+from typing import Union, List, Any, Callable, Optional
 
 import requests
 from retrying import retry
 
 from src.constants import HEADERS, BASE_URL
+from src.utils import is_valid_transfer_params
+
+
+TRANSFER_ATTEMPTS = 5
+NON_RETRYABLE_TRANSFER_CODES = frozenset({
+    -1, -4, -6, -7, -8, -9, -10, -12, -62, 2, 4, 12, 20, 105, 404,
+})
 
 
 class Network:
     """
     网络请求相关类。
-    注意，此类函数用 retry 来处理网络问题，达到重试次数则由主函数来捕获异常，中断运行。只要请求能返回数据，都可以正确处理。
+    网络异常和临时转存错误使用有界重试；单链接失败由 Operations 记录后继续。
     请求地址没有取全参数（params），只留关键参数。
     """
 
@@ -26,7 +34,7 @@ class Network:
         初始化会话、请求头和 bdstoken。
         """
         self.s = requests.Session()
-        self.headers = HEADERS
+        self.headers = HEADERS.copy()
         self.bdstoken = ''
         # 忽略证书验证警告
         requests.packages.urllib3.disable_warnings()
@@ -96,14 +104,20 @@ class Network:
             'bdstoken': self.bdstoken
         }
         data = {
-            'path': folder_name,
+            'path': f'/{folder_name.strip("/")}',
             'isdir': '1',
             'block_list': '[]',
+            'rtype': '0',
         }
 
         r = self.s.post(url=url, params=params, headers=self.headers, data=data, timeout=15, allow_redirects=False, verify=False)
 
-        return r.json()['errno']
+        payload = r.json()
+        errno = payload['errno']
+        created_path = payload.get('path')
+        if errno == 0 and created_path and created_path.rstrip('/') != data['path'].rstrip('/'):
+            raise ValueError(f'创建目录返回的路径与请求不一致：{created_path}')
+        return errno
 
     @retry(stop_max_attempt_number=3, wait_random_min=1000, wait_random_max=2000)
     def verify_pass_code(self, link_url: str, pass_code: str) -> Union[str, int]:
@@ -154,15 +168,23 @@ class Network:
 
         return r.content.decode("utf-8")
 
-    @retry(stop_max_attempt_number=5, wait_random_min=1000, wait_random_max=2000)
-    def transfer_file(self, params_list: List[str], folder_name: str) -> int:
+    def transfer_file(
+        self,
+        params_list: List[Any],
+        folder_name: str,
+        on_retry: Optional[Callable[[int, Any], None]] = None,
+    ) -> int:
         """
         转存百度网盘文件。
 
         :param params_list: 带有 shareid、share_uk 和 fs_id 的列表
         :param folder_name: 转存目标目录
+        :param on_retry: 重试前通知调用方下一次尝试次数与失败原因
         :return: 返回转存请求结果代码
         """
+        if not is_valid_transfer_params(params_list):
+            return -1
+
         url = f'{BASE_URL}/share/transfer'
         params = {
             # shareid 是文件 id
@@ -176,14 +198,34 @@ class Network:
         }
         data = {
             # 针对一个分享链接带有多个分享文件的情况，转换一下列表格式
-            'fsidlist': f"[{','.join(params_list[2])}]",
+            'fsidlist': f"[{','.join(dict.fromkeys(params_list[2]))}]",
             # 目标目录为空，则直接等于根目录 '/'
-            'path': f'/{folder_name}'
+            'path': f'/{folder_name.strip("/")}'
         }
 
-        r = self.s.post(url=url, params=params, headers=self.headers, data=data, timeout=30, allow_redirects=False, verify=False)
+        for attempt in range(1, TRANSFER_ATTEMPTS + 1):
+            try:
+                r = self.s.post(
+                    url=url, params=params, headers=self.headers, data=data,
+                    timeout=30, allow_redirects=False, verify=False,
+                )
+                r.raise_for_status()
+                payload = r.json()
+                if not isinstance(payload, dict) or type(payload.get('errno')) is not int:
+                    raise ValueError('转存接口返回了无效的 errno')
+                result = payload['errno']
+            except (requests.RequestException, ValueError) as error:
+                if attempt == TRANSFER_ATTEMPTS:
+                    raise
+                reason = type(error).__name__
+            else:
+                if result == 0 or result in NON_RETRYABLE_TRANSFER_CODES or attempt == TRANSFER_ATTEMPTS:
+                    return result
+                reason = result
 
-        return r.json()['errno']
+            if on_retry:
+                on_retry(attempt + 1, reason)
+            time.sleep(random.uniform(1, 2))
 
     @retry(stop_max_attempt_number=3, wait_random_min=1000, wait_random_max=2000)
     def create_share(self, fs_id: int, expiry: str, password: str) -> Union[str, int]:
