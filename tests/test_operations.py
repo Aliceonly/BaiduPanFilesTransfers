@@ -145,6 +145,124 @@ def test_unknown_transfer_result_keeps_current_directory_and_checkpoint():
     assert "结果未知" in operation.root.text_logs.value
 
 
+def test_unknown_transfer_is_confirmed_by_target_directory_listing():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    transfers = []
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: transfers.append(path) or UNKNOWN_RESULT
+    )
+    operation.network.get_dir_list = lambda _path: [
+        {"server_filename": "file", "isdir": 0, "fs_id": "900"},
+    ]
+
+    operation.handle_process_save()
+
+    assert transfers == ["target/1"]
+    assert operation.next_task_index == 1
+    assert operation.unknown_transfer_tasks == set()
+    assert "已自动核对到转存结果" in operation.root.text_logs.value
+    assert "转存成功" in operation.root.text_logs.value
+
+
+def test_unknown_transfer_rechecks_before_sending_a_duplicate_request():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    transfers = []
+    listings = iter([
+        [],
+        [{"server_filename": "file", "isdir": 0, "fs_id": "900"}],
+    ])
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: transfers.append(path) or UNKNOWN_RESULT
+    )
+    operation.network.get_dir_list = lambda _path: next(listings)
+
+    operation.handle_process_save()
+    assert operation.next_task_index == 0
+
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert transfers == ["target/1"]
+    assert operation.next_task_index == 1
+    assert operation.unknown_transfer_tasks == set()
+
+
+def test_normal_mode_unknown_verification_ignores_preexisting_same_name():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.custom_mode = False
+    operation.destination_baselines["target"] = [
+        {"server_filename": "file", "isdir": 0, "fs_id": "before"},
+    ]
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.network.get_dir_list = lambda _path: [
+        {"server_filename": "file", "isdir": 0, "fs_id": "before"},
+    ]
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+    assert operation.unknown_transfer_tasks == {0}
+
+
+def test_verified_transfer_parameters_are_cached_across_title_rows():
+    operation = make_operation(
+        "first https://pan.baidu.com/s/1same 1234\n"
+        "second https://pan.baidu.com/s/1same 1234"
+    )
+    verifications = []
+    operation.verify_link = (
+        lambda *args: verifications.append(args) or VALID_RESULT
+    )
+
+    operation.handle_process_save()
+
+    assert len(verifications) == 1
+    assert operation.completed_task_count == 2
+
+
+def test_no_password_pages_are_prefetched_with_an_isolated_session(monkeypatch):
+    operation = make_operation(
+        "https://pan.baidu.com/s/no-password\n"
+        "https://pan.baidu.com/s/with-password 1234"
+    )
+    operation.network.bdstoken = "token"
+    created = []
+
+    class ReadNetwork:
+        def __init__(self):
+            self.headers = {}
+            self.bdstoken = ""
+            self.s = SimpleNamespace(trust_env=False, close=lambda: None)
+            created.append(self)
+
+        def get_transfer_params(self, _url, on_retry=None):
+            return json.dumps({
+                "shareid": 123,
+                "share_uk": 456,
+                "fs_id": 789,
+                "isdir": 0,
+                "server_filename": "file",
+            })
+
+    monkeypatch.setattr("src.operations.Network", ReadNetwork)
+    monkeypatch.setattr(
+        "src.operations.thread_it",
+        lambda func, *args: func(*args),
+    )
+    operation.verify_link = lambda *_args: pytest.fail(
+        "prefetched result should be consumed"
+    )
+
+    operation.schedule_prefetch(0)
+    result = operation.get_cached_transfer_params(
+        "https://pan.baidu.com/s/no-password"
+    )
+
+    assert result == VALID_RESULT
+    assert len(created) == 1
+
+
 def test_resuming_unknown_transfer_reuses_the_same_directory():
     operation = make_operation("https://pan.baidu.com/s/1first 1234")
     paths = []

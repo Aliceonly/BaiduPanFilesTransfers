@@ -11,7 +11,9 @@ import inspect
 import threading
 import time
 import traceback
-from typing import Union, List, Dict, Any
+from collections import Counter
+from dataclasses import dataclass
+from typing import Union, List, Dict, Any, Tuple
 
 import requests
 
@@ -42,6 +44,26 @@ class CancellationRequested(RuntimeError):
     """窗口关闭或用户取消了 worker。"""
 
 
+@dataclass
+class UnknownTransferState:
+    """保存一次结果未知的转存，以便在恢复前后核对目标目录。"""
+
+    params: List[Any]
+    folder_name: str
+    url_code: str
+    baseline_items: List[Dict[str, Any]]
+
+
+@dataclass
+class PrefetchState:
+    """保存后台预取的分享页面结果，主 worker 只负责按顺序消费。"""
+
+    event: threading.Event
+    cookie_generation: int
+    result: Union[List[Any], int, None] = None
+    error: Exception = None
+
+
 class Operations:
     """
     包括主功能实现流程，涉及部分对 UI 的操作。
@@ -49,6 +71,8 @@ class Operations:
 
     :param root: 主窗口
     """
+
+    PREFETCH_WORKERS = 3
 
     def __init__(self, root):
         self.root = root
@@ -58,6 +82,11 @@ class Operations:
         self.used_custom_dirs = set()
         self.pending_custom_dirs = {}
         self.unknown_transfer_tasks = set()
+        self.unknown_transfer_states: Dict[int, UnknownTransferState] = {}
+        self.destination_baselines: Dict[str, List[Dict[str, Any]]] = {}
+        self.transfer_params_cache: Dict[Tuple[str, str], Union[List[Any], int]] = {}
+        self.prefetch_states: Dict[Tuple[str, str], PrefetchState] = {}
+        self.cookie_generation = 0
         self.saved_links = set()
         self.link_list = []
         self.link_list_org = []
@@ -269,6 +298,7 @@ class Operations:
                 self.network.headers['Cookie'] = user_cookie
                 self.cookie = user_cookie
                 self.batch_cookie = user_cookie
+                self.cookie_generation += 1
             else:
                 self.cookie = self.network.headers.get('Cookie', user_cookie)
             self.network.reset_session()
@@ -290,6 +320,11 @@ class Operations:
             self.used_custom_dirs = set()
             self.pending_custom_dirs = {}
             self.unknown_transfer_tasks = set()
+            self.unknown_transfer_states = {}
+            self.destination_baselines = {}
+            self.transfer_params_cache = {}
+            self.prefetch_states = {}
+            self.cookie_generation = 0
             self.saved_links = set()
             self.link_list = []
             self.link_list_org = []
@@ -409,6 +444,10 @@ class Operations:
                 raise PermanentTaskError(f'创建目录失败，错误代码：{return_code}')
         elif not isinstance(result, list):
             raise RetryableTaskError(f'无法检查目录 {folder_name}，请求返回：{result}')
+        if not require_empty:
+            # Keep one snapshot for lazy verification of an ambiguous transfer.
+            # It avoids an extra list request for every normal-mode transfer.
+            self.destination_baselines[folder_name] = list(result) if isinstance(result, list) else []
         self.created_dirs.add(folder_name)
         return True
 
@@ -417,6 +456,7 @@ class Operations:
         while self.next_task_index < len(self.link_list):
             self._check_cancelled()
             task_index = self.next_task_index
+            self.schedule_prefetch(task_index + 1)
             url_code = self.link_list[task_index]
             raw_link = self.link_list_org[task_index]
             if self.process_save(url_code, raw_link) is False:
@@ -584,13 +624,87 @@ class Operations:
         if not self.check_mode and not self.custom_mode and url_code in self.saved_links:
             return self.save_file(4, url_code, self.folder_name, raw_link)
         # 验证链接是否有效，返回的数字为错误代码，反之返回参数列表
-        result = self.verify_link(*parse_url_and_code(url_code))
+        result = self.get_cached_transfer_params(url_code)
         # 如果开启检查模式，插入检查结果，然后结束
         if self.check_mode:
             self.check_only(result, url_code)
             return True
         else:
             return self.save_file(result, url_code, self.folder_name, raw_link)
+
+    def get_cached_transfer_params(self, url_code: str) -> Union[List[Any], int]:
+        """按分享 URL 和提取码缓存验证结果，减少重复页面请求。"""
+        url, password = parse_url_and_code(url_code)
+        cache_key = (url, password)
+        prefetch = self.prefetch_states.get(cache_key)
+        if prefetch is not None:
+            while not prefetch.event.wait(DELAY_SECONDS):
+                self._check_cancelled()
+            self.prefetch_states.pop(cache_key, None)
+            if prefetch.cookie_generation != self.cookie_generation:
+                # A password verification changed BDCLND while this page was
+                # being fetched. Retry it with the current main Session.
+                return self.get_cached_transfer_params(url_code)
+            if prefetch.error is not None:
+                raise RetryableTaskError(
+                    f'获取分享页面请求失败：{prefetch.error}'
+                ) from prefetch.error
+            self.transfer_params_cache[cache_key] = prefetch.result
+        if cache_key not in self.transfer_params_cache:
+            self.transfer_params_cache[cache_key] = self.verify_link(url, password)
+        return self.transfer_params_cache[cache_key]
+
+    def schedule_prefetch(self, start_index: int) -> None:
+        """后台预取后续无提取码链接，主 worker 仍按输入顺序转存。"""
+        if not self.network.bdstoken or self.cancel_event.is_set():
+            return
+
+        pending_count = sum(
+            not state.event.is_set() for state in self.prefetch_states.values()
+        )
+        if pending_count >= self.PREFETCH_WORKERS:
+            return
+
+        scan_end = min(len(self.link_list), start_index + self.PREFETCH_WORKERS * 2)
+        for index in range(start_index, scan_end):
+            if pending_count >= self.PREFETCH_WORKERS:
+                break
+            url, password = parse_url_and_code(self.link_list[index])
+            if password or 'https://pan.baidu.com/' not in url:
+                continue
+            cache_key = (url, password)
+            if cache_key in self.transfer_params_cache or cache_key in self.prefetch_states:
+                continue
+            state = PrefetchState(
+                event=threading.Event(),
+                cookie_generation=self.cookie_generation,
+            )
+            self.prefetch_states[cache_key] = state
+            thread_it(self._prefetch_transfer_params, url, state)
+            pending_count += 1
+
+    def _prefetch_transfer_params(self, url: str, state: PrefetchState) -> None:
+        """用独立 Session 预取无提取码分享页，避免并发操作主 Session。"""
+        network = Network()
+        try:
+            if self.cancel_event.is_set():
+                state.error = CancellationRequested()
+                return
+            network.headers = self.network.headers.copy()
+            network.bdstoken = self.network.bdstoken
+            network.s.trust_env = self.network.s.trust_env
+            response = network.get_transfer_params(
+                url,
+                on_retry=self._retry_log,
+            )
+            state.result = parse_response(response)
+        except Exception as error:
+            state.error = error
+        finally:
+            try:
+                network.s.close()
+            finally:
+                state.event.set()
 
     def verify_link(self, url: str, password: str) -> Union[List[Any], int]:
         """验证链接有效性，验证通过返回转存所需参数列表"""
@@ -610,6 +724,7 @@ class Operations:
 
             # 更新 bdclnd 到 cookie
             self.network.headers['Cookie'] = update_cookie(bdclnd, self.network.headers['Cookie'])
+            self.cookie_generation += 1
 
         # 直接访问没有提取码的链接，或更新 bdclnd 后再次访问，获取转存必须的 3 个参数
         try:
@@ -745,21 +860,112 @@ class Operations:
 
     def transfer_with_logs(self, params: List[Any], folder_name: str, url_code: str) -> Union[int, str]:
         """记录每次重试；重试期间使用相同的链接与目录。"""
+        task_key = self.next_task_index
+        if task_key in self.unknown_transfer_states:
+            if self.verify_unknown_transfer(task_key):
+                return 0
+
         def on_retry(attempt, reason):
             self.insert_logs(f'转存失败（{reason}），正在第 {attempt} 次尝试：{url_code}')
 
         try:
             result = self.network.transfer_file(params, folder_name, on_retry=on_retry)
         except RetryExhaustedError as error:
+            self._remember_unknown_transfer(task_key, params, folder_name, url_code)
+            if self.verify_unknown_transfer(task_key):
+                return 0
             raise RetryableTaskError(f'转存请求失败：{error}') from error
         except requests.RequestException:
             result = UNKNOWN_RESULT
-        task_key = self.next_task_index
         if result == UNKNOWN_RESULT:
-            self.unknown_transfer_tasks.add(task_key)
+            self._remember_unknown_transfer(task_key, params, folder_name, url_code)
+            if self.verify_unknown_transfer(task_key):
+                return 0
         elif result == 0:
             self.unknown_transfer_tasks.discard(task_key)
+            self.unknown_transfer_states.pop(task_key, None)
+            self._remember_transfer_items(folder_name, params)
         elif task_key in self.unknown_transfer_tasks:
             # A failed new attempt cannot disprove an earlier ambiguous write.
             return UNKNOWN_RESULT
         return result
+
+    def _remember_unknown_transfer(
+        self,
+        task_key: int,
+        params: List[Any],
+        folder_name: str,
+        url_code: str,
+    ) -> None:
+        self.unknown_transfer_tasks.add(task_key)
+        self.unknown_transfer_states[task_key] = UnknownTransferState(
+            params=params,
+            folder_name=folder_name,
+            url_code=url_code,
+            baseline_items=list(self.destination_baselines.get(folder_name, [])),
+        )
+
+    @staticmethod
+    def _transfer_item_key(item: Dict[str, Any]) -> Tuple[str, str]:
+        """Normalize a directory-list item for conservative comparison."""
+        return (
+            str(item.get('server_filename', '')),
+            str(item.get('isdir', '0')),
+        )
+
+    def _expected_transfer_items(self, params: List[Any]) -> Counter:
+        return Counter(
+            (str(filename), str(isdir))
+            for filename, isdir in zip(params[3], params[4])
+        )
+
+    def _remember_transfer_items(self, folder_name: str, params: List[Any]) -> None:
+        """Update the baseline after a confirmed transfer without another list call."""
+        baseline = self.destination_baselines.setdefault(folder_name, [])
+        baseline.extend(
+            {'server_filename': filename, 'isdir': isdir}
+            for filename, isdir in zip(params[3], params[4])
+        )
+
+    def verify_unknown_transfer(self, task_key: int) -> bool:
+        """Check whether an ambiguous transfer is already visible in its target."""
+        state = self.unknown_transfer_states.get(task_key)
+        if state is None:
+            return False
+
+        try:
+            current = self._network_call(
+                self.network.get_dir_list,
+                f'/{state.folder_name}',
+            )
+        except (RetryableTaskError, PermanentTaskError):
+            return False
+        if not isinstance(current, list):
+            return False
+
+        baseline_counts = Counter(
+            self._transfer_item_key(item)
+            for item in state.baseline_items
+            if isinstance(item, dict)
+        )
+        current_counts = Counter(
+            self._transfer_item_key(item)
+            for item in current
+            if isinstance(item, dict)
+        )
+        new_counts = current_counts - baseline_counts
+        expected_counts = self._expected_transfer_items(state.params)
+        confirmed = all(
+            new_counts[item_key] >= count
+            for item_key, count in expected_counts.items()
+        )
+        if not confirmed:
+            return False
+
+        self.unknown_transfer_tasks.discard(task_key)
+        self.unknown_transfer_states.pop(task_key, None)
+        self.destination_baselines[state.folder_name] = list(current)
+        self.insert_logs(
+            f'已自动核对到转存结果：{state.url_code} 转存到：{state.folder_name}'
+        )
+        return True

@@ -366,43 +366,19 @@ class Network:
             'fsidlist': f"[{','.join(dict.fromkeys(params_list[2]))}]",
             'path': f'/{folder_name.strip("/")}',
         }
-        result_unknown = False
-
-        for attempt in range(1, TRANSFER_ATTEMPTS + 1):
-            try:
-                response = self.s.post(
-                    url=url, params=params, headers=self.headers, data=data,
-                    timeout=30, allow_redirects=False, verify=False,
-                )
-                raise_for_status = getattr(response, 'raise_for_status', None)
-                if raise_for_status:
-                    raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict) or type(payload.get('errno')) is not int:
-                    raise ValueError('转存接口返回了无效的 errno')
-                result = payload['errno']
-            except (requests.RequestException, ValueError, TypeError,
-                    AttributeError, KeyError, UnicodeError) as error:
-                result_unknown = True
-                if attempt == TRANSFER_ATTEMPTS:
-                    return UNKNOWN_RESULT
-                self._notify_retry(on_retry, attempt, type(error).__name__)
-                self._sleep_before_retry()
-                continue
-
-            if result == 0:
-                return 0
-            if result in NON_RETRYABLE_TRANSFER_CODES:
-                return UNKNOWN_RESULT if result_unknown else result
-            if attempt == TRANSFER_ATTEMPTS:
-                if result_unknown:
-                    return UNKNOWN_RESULT
-                raise RetryExhaustedError(result)
-
-            self._notify_retry(on_retry, attempt, result)
-            self._sleep_before_retry()
-
-        return UNKNOWN_RESULT
+        payload = self._request_json(
+            lambda: self.s.post(
+                url=url, params=params, headers=self.headers, data=data,
+                timeout=30, allow_redirects=False, verify=False,
+            ),
+            on_retry=on_retry,
+            unknown_on_exhaustion=True,
+        )
+        if payload == UNKNOWN_RESULT:
+            return UNKNOWN_RESULT
+        if isinstance(payload, int):
+            return payload
+        return payload['errno']
 
     def create_share(
         self,
