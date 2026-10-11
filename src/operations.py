@@ -13,8 +13,10 @@ import time
 import traceback
 from typing import Union, List, Dict, Any
 
+import requests
+
 from src.constants import EXP_MAP, DELAY_SECONDS, INVALID_CHARS, ERROR_CODES, SAVE_LIMIT, COLOR_MAP
-from src.network import Network, UNKNOWN_RESULT
+from src.network import Network, RetryExhaustedError, UNKNOWN_RESULT
 from src.ui import CustomDialog
 from src.utils import (
     thread_it,
@@ -55,6 +57,7 @@ class Operations:
         self.created_dirs = set()
         self.used_custom_dirs = set()
         self.pending_custom_dirs = {}
+        self.unknown_transfer_tasks = set()
         self.saved_links = set()
         self.link_list = []
         self.link_list_org = []
@@ -133,9 +136,13 @@ class Operations:
             parameters = inspect.signature(method).parameters
         except (TypeError, ValueError):
             parameters = {}
-        if 'on_retry' in parameters:
-            return method(*args, on_retry=self._retry_log)
-        return method(*args)
+        try:
+            if 'on_retry' in parameters:
+                return method(*args, on_retry=self._retry_log)
+            return method(*args)
+        except (requests.RequestException, ValueError, TypeError, KeyError,
+                AttributeError) as error:
+            raise RetryableTaskError(f'API 请求失败：{error}') from error
 
     def _check_cancelled(self) -> None:
         if self.cancel_event.is_set():
@@ -282,6 +289,7 @@ class Operations:
             self.created_dirs = set()
             self.used_custom_dirs = set()
             self.pending_custom_dirs = {}
+            self.unknown_transfer_tasks = set()
             self.saved_links = set()
             self.link_list = []
             self.link_list_org = []
@@ -307,11 +315,7 @@ class Operations:
             'placeholder_text',
             lambda: getattr(self.root.text_links, 'placeholder_text', ''),
         )
-        is_placeholder = self._input_value(
-            'is_placeholder',
-            lambda: getattr(self.root.text_links, 'is_placeholder', False),
-        )
-        if is_placeholder or (placeholder and text_value.strip() == placeholder.strip()):
+        if placeholder and text_value.strip() == placeholder.strip():
             raw_links = []
         else:
             raw_links = [link for link in text_value.splitlines() if link.strip()]
@@ -394,8 +398,10 @@ class Operations:
                 raise RetryableTaskError(f'无法检查目录 {folder_name}，请求返回：{result}')
             return not result
 
-        # 如果 result 为错误代码数字，代表目标目录不存在
+        # Only a not-found response permits creating the requested directory.
         if folder_name and isinstance(result, int):
+            if result not in (-9, 2):
+                raise PermanentTaskError(f'无法检查目录 {folder_name}，错误代码：{result}')
             return_code = self._network_call(self.network.create_dir, folder_name)
             if return_code == UNKNOWN_RESULT:
                 raise RetryableTaskError(f'创建目录结果未知：{folder_name}')
@@ -444,13 +450,16 @@ class Operations:
             self.insert_logs(f'当前任务结果未知，保留断点：{e}：{url_code}')
             return False
         except PermanentTaskError as e:
+            if self.next_task_index in self.unknown_transfer_tasks:
+                self.insert_logs(f'无法确认先前的转存结果，保留断点：{e}：{url_code}')
+                return False
             self.insert_logs(f'转存失败：{e}：{url_code}')
             return True
         except Exception as e:
             # Unexpected item-level errors are isolated so one malformed row
             # cannot abort the remaining batch.
             self.insert_logs(f'转存时发生未预料错误：{e}：{url_code}')
-            return True
+            return self.next_task_index not in self.unknown_transfer_tasks
 
     def process_share(self, info: Dict[str, Any]) -> None:
         """执行分享操作并记录结果"""
@@ -518,6 +527,8 @@ class Operations:
             self.root.bottom_share.config(state="disabled")
         elif status == 'sharing':
             self.root.text_links.delete(1.0, 'end')
+            self.root.text_links.is_placeholder = False
+            self.root.text_links.config(fg=COLOR_MAP['text'])
             self.root.bottom_share.config(state="disabled")
             self.root.bottom_save.config(state="disabled")
         elif status == 'error':
@@ -640,6 +651,8 @@ class Operations:
                 )
             task_key = self.next_task_index
             self.pending_custom_dirs[task_key] = folder_name
+            if numeric_name:
+                self.custom_dir_count = directory_number + offset
             try:
                 directory_available = self.handle_create_dir(folder_name, require_empty=True)
             except PermanentTaskError:
@@ -647,8 +660,6 @@ class Operations:
                 raise
             if directory_available:
                 self.used_custom_dirs.add(folder_name)
-                if numeric_name:
-                    self.custom_dir_count = directory_number + offset
                 return folder_name
         self.pending_custom_dirs.pop(self.next_task_index, None)
         raise RuntimeError(f'无法为当前链接创建空目录：{base_path}')
@@ -669,6 +680,21 @@ class Operations:
                 transfer_params = result
                 task_key = self.next_task_index
                 pending_folder = self.pending_custom_dirs.get(task_key)
+                if pending_folder and pending_folder not in self.used_custom_dirs:
+                    # A pending path may have been recorded before creation
+                    # was confirmed. Never transfer until it is ready.
+                    try:
+                        directory_available = self.handle_create_dir(
+                            pending_folder, require_empty=True,
+                        )
+                    except PermanentTaskError:
+                        self.pending_custom_dirs.pop(task_key, None)
+                        raise
+                    if directory_available:
+                        self.used_custom_dirs.add(pending_folder)
+                    else:
+                        self.pending_custom_dirs.pop(task_key, None)
+                        pending_folder = None
                 if pending_folder:
                     folder_name = pending_folder
                 else:
@@ -705,6 +731,9 @@ class Operations:
                 if result == 0:
                     self.saved_links.add(url_code)
         else:
+            if self.next_task_index in self.unknown_transfer_tasks:
+                self.insert_logs(f'无法确认先前的转存结果，保留断点：{url_code}')
+                return False
             result = result if isinstance(result, int) else -1
 
         if not isinstance(result, int):
@@ -719,4 +748,18 @@ class Operations:
         def on_retry(attempt, reason):
             self.insert_logs(f'转存失败（{reason}），正在第 {attempt} 次尝试：{url_code}')
 
-        return self.network.transfer_file(params, folder_name, on_retry=on_retry)
+        try:
+            result = self.network.transfer_file(params, folder_name, on_retry=on_retry)
+        except RetryExhaustedError as error:
+            raise RetryableTaskError(f'转存请求失败：{error}') from error
+        except requests.RequestException:
+            result = UNKNOWN_RESULT
+        task_key = self.next_task_index
+        if result == UNKNOWN_RESULT:
+            self.unknown_transfer_tasks.add(task_key)
+        elif result == 0:
+            self.unknown_transfer_tasks.discard(task_key)
+        elif task_key in self.unknown_transfer_tasks:
+            # A failed new attempt cannot disprove an earlier ambiguous write.
+            return UNKNOWN_RESULT
+        return result

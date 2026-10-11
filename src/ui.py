@@ -191,16 +191,20 @@ class TextEditor:
         """文本框获得焦点时，清除提示文字"""
         if text.get("1.0", "end-1c") == placeholder:
             text.delete("1.0", "end")
-            text.config(fg=COLOR_MAP['text'])
-            text.is_placeholder = False
+        text.config(fg=COLOR_MAP['text'])
+        text.is_placeholder = False
 
     @staticmethod
     def _on_focus_out(text: ttk.Text, placeholder: str) -> None:
         """文本框失去焦点时，添加提示文字"""
-        if not text.get("1.0", "end-1c"):
+        content = text.get("1.0", "end-1c")
+        if not content:
             text.insert("1.0", placeholder)
             text.config(fg=COLOR_MAP['placeholder'])
             text.is_placeholder = True
+        else:
+            text.is_placeholder = content == placeholder
+            text.config(fg=COLOR_MAP['placeholder' if text.is_placeholder else 'text'])
 
 
 class CustomDialog(ttk.Toplevel):

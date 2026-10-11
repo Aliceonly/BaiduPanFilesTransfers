@@ -6,9 +6,10 @@ from src.utils import parse_response, parse_url_and_code
 
 
 class FakeResponse:
-    def __init__(self, errno, payload=None):
+    def __init__(self, errno, payload=None, content=b""):
         self.errno = errno
         self.payload = {"errno": errno} if payload is None else payload
+        self.content = content
 
     def json(self):
         return self.payload
@@ -64,23 +65,40 @@ def test_parse_response_rejects_mismatched_file_fields():
     assert parse_response(response) == -1
 
 
-def test_transfer_exhaustion_returns_the_last_errno(monkeypatch):
+def test_transfer_exhaustion_raises_a_retryable_error(monkeypatch):
     network = Network()
     network.s = FakeSession([FakeResponse(500) for _ in range(5)])
     sleeps = []
     attempts = []
     monkeypatch.setattr("src.network.time.sleep", sleeps.append)
 
-    result = network.transfer_file(
-        ["123", "456", ["789"], ["file"], ["0"]], "target",
-        on_retry=lambda attempt, reason: attempts.append((attempt, reason)),
-    )
+    with pytest.raises(requests.RequestException, match="500"):
+        network.transfer_file(
+            ["123", "456", ["789"], ["file"], ["0"]], "target",
+            on_retry=lambda attempt, reason: attempts.append((attempt, reason)),
+        )
 
-    assert result == 500
     assert network.s.calls == 5
     assert len(sleeps) == 4
     assert attempts == [(2, 500), (3, 500), (4, 500), (5, 500)]
     assert all(1 <= delay <= 2 for delay in sleeps)
+
+
+@pytest.mark.parametrize("method", ["get_bdstoken", "get_dir_list", "verify_pass_code", "create_dir"])
+def test_temporary_api_errno_exhaustion_raises_instead_of_becoming_permanent(monkeypatch, method):
+    network = Network()
+    network.s = FakeSession([FakeResponse(500)] * 5)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    arguments = {
+        "get_bdstoken": (), "get_dir_list": ("/target",),
+        "verify_pass_code": ("https://pan.baidu.com/s/1first", "1234"),
+        "create_dir": ("target/1",),
+    }
+
+    with pytest.raises(requests.RequestException, match="500"):
+        getattr(network, method)(*arguments[method])
+
+    assert network.s.calls == 5
 
 
 def test_transfer_timeout_retries_without_changing_destination(monkeypatch):
@@ -112,13 +130,45 @@ def test_transfer_timeout_then_collision_keeps_result_unknown(monkeypatch):
     assert retries == [(2, "Timeout")]
 
 
-def test_exhausted_timeouts_raise_for_item_level_handling(monkeypatch):
+@pytest.mark.parametrize("errno", [-6, 20, 500])
+def test_failure_after_timeout_cannot_discard_an_unknown_outcome(monkeypatch, errno):
+    network = Network()
+    network.s = FakeSession([requests.Timeout("timeout")] + [FakeResponse(errno)] * 4)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    result = network.transfer_file(
+        ["123", "456", ["789"], ["file"], ["0"]], "target/1",
+        on_retry=lambda *_args: None,
+    )
+
+    assert result == UNKNOWN_RESULT
+    assert network.s.calls == (5 if errno == 500 else 2)
+
+
+@pytest.mark.parametrize("method, arguments", [
+    ("create_dir", ("target/1",)),
+    ("create_share", (789, 0, "1234")),
+])
+@pytest.mark.parametrize("errno", [-8, 500])
+def test_side_effecting_json_api_retains_unknown_outcome_after_timeout(
+    monkeypatch, method, arguments, errno,
+):
+    network = Network()
+    network.s = FakeSession([requests.Timeout("timeout")] + [FakeResponse(errno)] * 4)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    assert getattr(network, method)(*arguments) == UNKNOWN_RESULT
+    assert network.s.calls == (5 if errno == 500 else 2)
+
+
+def test_exhausted_timeouts_return_unknown_even_without_a_callback(monkeypatch):
     network = Network()
     network.s = FakeSession([requests.Timeout("timeout") for _ in range(5)])
     monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
 
-    with pytest.raises(requests.Timeout):
-        network.transfer_file(["123", "456", ["789"], ["file"], ["0"]], "target")
+    assert network.transfer_file(
+        ["123", "456", ["789"], ["file"], ["0"]], "target",
+    ) == UNKNOWN_RESULT
 
     assert network.s.calls == 5
 
@@ -194,6 +244,53 @@ def test_get_bdstoken_retries_invalid_response_five_times(monkeypatch):
     assert [attempt for attempt, _reason in retries] == [2, 3, 4, 5]
 
 
+SHARE_PAGE = b'{"shareid":123,"share_uk":456,"fs_id":789,"isdir":0,"server_filename":"file"}'
+
+
+@pytest.mark.parametrize("invalid_page", [
+    b"<html>upstream busy</html>",
+    b'<script>var errorMessage="' + "分享已取消".encode() + b'";</script><p>Busy</p>',
+])
+def test_invalid_nonempty_share_pages_are_retried(monkeypatch, invalid_page):
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, content=invalid_page),
+        FakeResponse(0, content=SHARE_PAGE),
+    ])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    attempts = []
+
+    page = network.get_transfer_params(
+        "https://pan.baidu.com/s/1first",
+        on_retry=lambda attempt, _reason: attempts.append(attempt),
+    )
+
+    assert page == SHARE_PAGE.decode()
+    assert network.s.calls == 2
+    assert attempts == [2]
+
+
+def test_invalid_share_page_exhaustion_is_not_returned_as_a_dead_link(monkeypatch):
+    network = Network()
+    network.s = FakeSession([FakeResponse(0, content=b"<p>Busy</p>")] * 5)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(ValueError):
+        network.get_transfer_params("https://pan.baidu.com/s/1first")
+
+    assert network.s.calls == 5
+
+
+@pytest.mark.parametrize("message", ["分享已取消", "分享的文件已经被删除了", "链接已失效"])
+def test_confirmed_unavailable_share_page_does_not_retry(message):
+    network = Network()
+    body = f"<html><p>{message}</p></html>".encode()
+    network.s = FakeSession([FakeResponse(0, content=body)])
+
+    assert network.get_transfer_params("https://pan.baidu.com/s/1first") == body.decode()
+    assert network.s.calls == 1
+
+
 def test_get_dir_list_reads_all_pages():
     first_page = [{"fs_id": str(index)} for index in range(1000)]
     second_page = [{"fs_id": "1000"}]
@@ -208,6 +305,91 @@ def test_get_dir_list_reads_all_pages():
     assert len(result) == 1001
     assert network.s.requests[0]["params"]["page"] == "1"
     assert network.s.requests[1]["params"]["page"] == "2"
+
+
+@pytest.mark.parametrize("errno", [-9, -6, 4])
+@pytest.mark.parametrize("extra", [{}, {"list": []}])
+def test_get_dir_list_returns_api_errors_without_reading_the_list(errno, extra):
+    network = Network()
+    network.s = FakeSession([FakeResponse(errno, {"errno": errno, **extra})])
+
+    assert network.get_dir_list("/target") == errno
+    assert network.s.calls == 1
+
+
+@pytest.mark.parametrize("metadata", [{"total": 1}, {"has_more": 1}, {"total": 1, "has_more": True}])
+def test_pagination_with_an_empty_page_and_more_metadata_stops_with_an_error(monkeypatch, metadata):
+    network = Network()
+    network.s = FakeSession([FakeResponse(0, {"errno": 0, "list": [], **metadata})] * 5)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(ValueError, match="pagination"):
+        network.get_dir_list("/target")
+
+    assert network.s.calls == 5
+
+
+def test_repeated_pagination_page_is_not_appended_or_requested_forever(monkeypatch):
+    page = {"errno": 0, "list": [{"fs_id": 1}], "has_more": 1}
+    network = Network()
+    network.s = FakeSession([FakeResponse(0, page)] * 6)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(ValueError, match="pagination"):
+        network.get_dir_list("/target")
+
+    assert network.s.calls == 6
+
+
+def test_pagination_cannot_cycle_between_two_pages(monkeypatch):
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, {"errno": 0, "list": [{"fs_id": fs_id}], "has_more": 1})
+        for fs_id in [1, 2, 1, 2, 1, 2, 1]
+    ])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(ValueError, match="pagination"):
+        network.get_dir_list("/target")
+
+    assert network.s.calls == 7
+
+
+def test_pagination_retries_conflicting_metadata_without_advancing_the_page(monkeypatch):
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, {"errno": 0, "list": [], "total": 1}),
+        FakeResponse(0, {"errno": 0, "list": [{"fs_id": 1}], "total": 1}),
+    ])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    assert network.get_dir_list("/target") == [{"fs_id": 1}]
+    assert [request["params"]["page"] for request in network.s.requests] == ["1", "1"]
+
+
+def test_pagination_retries_a_repeated_page_then_returns_the_complete_list(monkeypatch):
+    first = {"errno": 0, "list": [{"fs_id": 1}], "has_more": 1}
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, first), FakeResponse(0, first),
+        FakeResponse(0, {"errno": 0, "list": [{"fs_id": 2}]}),
+    ])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    assert network.get_dir_list("/target") == [{"fs_id": 1}, {"fs_id": 2}]
+    assert [request["params"]["page"] for request in network.s.requests] == ["1", "2", "2"]
+
+
+def test_directory_without_more_metadata_stops_at_a_normal_empty_final_page():
+    first = [{"fs_id": index} for index in range(1000)]
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, {"errno": 0, "list": first}),
+        FakeResponse(0, {"errno": 0, "list": []}),
+    ])
+
+    assert network.get_dir_list("/target") == first
+    assert network.s.calls == 2
 
 
 def test_network_instances_do_not_share_cookie_headers():

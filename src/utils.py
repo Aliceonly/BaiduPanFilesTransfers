@@ -7,6 +7,7 @@
 """
 import atexit
 import base64
+import html
 import json
 import os
 import random
@@ -204,6 +205,18 @@ def is_valid_transfer_params(params: Any) -> bool:
     )
 
 
+def is_permanent_share_error(response: str) -> bool:
+    """Recognize explicit unavailable-link messages, not script templates."""
+    visible = re.sub(r'<(script|style)\b[^>]*>.*?</\1\s*>', '', response, flags=re.I | re.S)
+    visible = html.unescape(re.sub(r'<[^>]+>', '', visible))
+    visible = re.sub(r'\s+', '', visible)
+    return any(message in visible for message in (
+        '分享已取消', '分享已过期', '分享已失效', '链接已失效', '链接不存在',
+        '分享的文件已经被删除', '分享的文件已经被取消',
+        '提取码错误', '分享密码错误', '此链接分享内容可能因为涉及',
+    ))
+
+
 def update_cookie(bdclnd: str, cookie: str) -> str:
     """
     更新 cookie 字符串，以包含新的 BDCLND 值。
@@ -212,8 +225,16 @@ def update_cookie(bdclnd: str, cookie: str) -> str:
     :param cookie: 当前的 cookie 字符串
     :return: 返回新 cookie 字符串
     """
-    # 拆分 cookie 字符串到字典。先用 ; 分割成列表，再用 = 分割出键和值
-    cookies_dict = dict(map(lambda item: item.split('=', 1), filter(None, cookie.split(';'))))
+    cookies_dict = {}
+    for field in cookie.split(';'):
+        field = field.strip()
+        if not field:
+            continue
+        key, separator, value = field.partition('=')
+        key = key.strip()
+        if not separator or not key:
+            raise ValueError('Cookie 字段格式不正确')
+        cookies_dict[key] = value
     # 在 cookie 字典中，更新或添加 BDCLND 的值
     cookies_dict['BDCLND'] = bdclnd
     # 从更新后的字典重新构建 cookie 字符串

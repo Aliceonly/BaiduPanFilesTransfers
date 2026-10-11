@@ -90,6 +90,10 @@ def test_parse_response(response, expected):
     ("newBDCLNDvalue", "SL=0:NR=10:FG=1;csrfToken=CJgzy", "SL=0:NR=10:FG=1;csrfToken=CJgzy;BDCLND=newBDCLNDvalue"),
     # 测试更新已存在的 BDCLND 值
     ("updatedBDCLNDvalue", "SL=0:NR=10:FG=1;csrfToken=CJgzy;BDCLND=oldBDCLNDvalue;SID=12345", "SL=0:NR=10:FG=1;csrfToken=CJgzy;BDCLND=updatedBDCLNDvalue;SID=12345"),
+    ("new", "BAIDUID=x; BDCLND=old; OTHER=y", "BAIDUID=x;BDCLND=new;OTHER=y"),
+    ("new", "BAIDUID=x; BDCLND=old; ", "BAIDUID=x;BDCLND=new"),
+    ("new", "BAIDUID=x; ; BDCLND=old;BDCLND=older;; ", "BAIDUID=x;BDCLND=new"),
+    ("new", "BAIDUID=x; TOKEN=a=b internal value; ", "BAIDUID=x;TOKEN=a=b internal value;BDCLND=new"),
     # 测试不正确的 cookie 字符串
     ("anotherBDCLND", "110085_287281_287977", "ValueError")
 ])

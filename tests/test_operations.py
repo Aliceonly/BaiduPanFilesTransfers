@@ -99,6 +99,36 @@ def test_placeholder_text_is_not_treated_as_a_real_link():
     assert operation.valid_link_count == 0
 
 
+def test_stale_placeholder_flag_does_not_hide_real_links():
+    operation = Operations(make_root("https://pan.baidu.com/s/1first 1234"))
+    operation.root.text_links.is_placeholder = True
+    operation.root.text_links.placeholder_text = "example links"
+
+    operation.prepare_run()
+    operation.setup_save()
+
+    assert operation.valid_link_count == 1
+    assert len(operation.link_list) == 1
+
+
+def test_sharing_then_pasting_links_does_not_keep_placeholder_state():
+    operation = make_save_operation("example links")
+    operation.root.text_links.is_placeholder = True
+    operation.root.text_links.placeholder_text = "example links"
+    operation.network.get_dir_list = lambda *_args: [
+        {"isdir": 0, "server_filename": "file", "fs_id": 1},
+    ]
+    operation.network.create_share = lambda *_args: "https://pan.baidu.com/s/1shared"
+    operation.share(SimpleNamespace(result=("永久", "1234", False)))
+
+    assert operation.root.text_links.is_placeholder is False
+    operation.root.text_links.value = "https://pan.baidu.com/s/1first 1234"
+    operation.save()
+
+    assert operation.valid_link_count == 1
+    assert operation.next_task_index == 1
+
+
 def test_unknown_transfer_result_keeps_current_directory_and_checkpoint():
     operation = make_operation("https://pan.baidu.com/s/1first 1234")
     paths = []
@@ -130,6 +160,152 @@ def test_resuming_unknown_transfer_reuses_the_same_directory():
     assert paths == ["target/1", "target/1"]
     assert operation.next_task_index == 1
     assert operation.custom_dir_count == 1
+
+
+@pytest.mark.parametrize("custom_mode", [True, False])
+@pytest.mark.parametrize("later_errno", [4, -6, 500])
+def test_resume_failure_keeps_an_unknown_transfer_at_its_original_destination(
+    custom_mode, later_errno,
+):
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.custom_mode = custom_mode
+    paths = []
+    results = iter([UNKNOWN_RESULT, later_errno, 0])
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or next(results)
+    )
+
+    operation.handle_process_save()
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    expected_path = "target/1" if custom_mode else "target"
+    assert paths == [expected_path, expected_path]
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert paths == [expected_path] * 3
+    assert operation.next_task_index == 1
+
+
+def test_failed_verification_on_resume_does_not_forget_an_unknown_transfer():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.handle_process_save()
+    operation.verify_link = lambda *_args: -6
+
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+    assert operation.pending_custom_dirs == {0: "target/1"}
+
+
+def test_unknown_result_survives_repeated_resume_button_runs(monkeypatch):
+    operation = make_save_operation(
+        "https://pan.baidu.com/s/1first 1234\nhttps://pan.baidu.com/s/1second 1234",
+    )
+    paths = []
+    results = iter([UNKNOWN_RESULT, 4, 0, 0])
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or next(results)
+    )
+    monkeypatch.setattr("src.operations.thread_it", lambda func, *args: func(*args))
+
+    operation.start_save()
+    assert operation.root.bottom_save.options["text"] == "继续转存"
+    operation.root.bottom_save.options["command"]()
+
+    assert paths == ["target/1", "target/1"]
+    assert operation.next_task_index == 0
+    assert operation.pending_custom_dirs == {0: "target/1"}
+    assert operation.unknown_transfer_tasks == {0}
+    assert operation.root.bottom_save.options["text"] == "继续转存"
+
+    operation.root.bottom_save.options["command"]()
+
+    assert paths == ["target/1", "target/1", "target/1", "target/2"]
+    assert operation.next_task_index == 2
+    assert operation.resume_available is False
+    assert operation.pending_custom_dirs == {}
+    assert operation.unknown_transfer_tasks == set()
+    assert operation.root.bottom_save.options["text"] == "批量转存"
+
+
+@pytest.mark.parametrize("confirmed_creation", [0, -8])
+def test_resume_confirms_unknown_directory_creation_before_transferring(confirmed_creation):
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    results = iter([UNKNOWN_RESULT, confirmed_creation])
+    calls = []
+    operation.network.create_dir = (
+        lambda path: calls.append(("create", path)) or next(results)
+    )
+    operation.network.get_dir_list = (
+        lambda path: calls.append(("list", path)) or []
+    )
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: calls.append(("transfer", path)) or 0
+    )
+
+    operation.handle_process_save()
+    assert operation.next_task_index == 0
+    assert calls == [("create", "target/1")]
+
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    expected = [("create", "target/1"), ("create", "target/1")]
+    if confirmed_creation == -8:
+        expected.append(("list", "/target/1"))
+    assert calls == expected + [("transfer", "target/1")]
+    assert operation.next_task_index == 1
+    assert operation.custom_dir_count == 1
+
+
+def test_resume_unknown_creation_does_not_transfer_into_a_nonempty_directory():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    calls = []
+    results = iter([UNKNOWN_RESULT, -8, 0])
+    operation.network.create_dir = (
+        lambda path: calls.append(("create", path)) or next(results)
+    )
+    operation.network.get_dir_list = lambda *_args: [{"server_filename": "unrelated"}]
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: calls.append(("transfer", path)) or 0
+    )
+
+    operation.handle_process_save()
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert calls == [
+        ("create", "target/1"), ("create", "target/1"),
+        ("create", "target/2"), ("transfer", "target/2"),
+    ]
+    assert operation.next_task_index == 1
+
+
+def test_unknown_creation_after_number_collision_preserves_the_allocated_number():
+    operation = make_operation(
+        "https://pan.baidu.com/s/1first 1234\nhttps://pan.baidu.com/s/1second 1234",
+    )
+    results = iter([-8, UNKNOWN_RESULT, 0, 0])
+    operation.network.create_dir = lambda *_args: next(results)
+    operation.network.get_dir_list = lambda *_args: [{"server_filename": "existing"}]
+    paths = []
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or 0
+    )
+
+    operation.handle_process_save()
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert paths == ["target/2", "target/3"]
+    assert operation.custom_dir_count == 3
 
 
 def test_share_item_exception_does_not_stop_following_items():
@@ -313,6 +489,48 @@ def test_existing_empty_directory_can_be_reused():
     assert paths == ["target/1"]
 
 
+def test_directory_listing_login_failure_does_not_trigger_creation():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.network.get_dir_list = lambda *_args: -6
+    created = []
+    operation.network.create_dir = lambda path: created.append(path) or 0
+
+    operation.save()
+
+    assert created == []
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+
+
+def test_save_creates_a_missing_base_directory_from_the_real_list_api_response():
+    operation = Operations(make_root("https://pan.baidu.com/s/1first 1234"))
+    operation.network.get_bdstoken = lambda: "token"
+    operation.verify_link = lambda *_args: VALID_RESULT
+    calls = []
+
+    def get(**kwargs):
+        calls.append(("list", kwargs["params"]["dir"]))
+        return SimpleNamespace(json=lambda: {"errno": -9}, raise_for_status=lambda: None)
+
+    def post(**kwargs):
+        action = "create" if kwargs["url"].endswith("/api/create") else "transfer"
+        calls.append((action, kwargs["data"]["path"]))
+        return SimpleNamespace(
+            json=lambda: {"errno": 0, "path": kwargs["data"]["path"]},
+            raise_for_status=lambda: None,
+        )
+
+    operation.network.s = SimpleNamespace(get=get, post=post, close=lambda: None)
+    operation.save()
+
+    assert calls == [
+        ("list", "/target"), ("create", "/target"),
+        ("create", "/target/1"), ("transfer", "/target/1"),
+    ]
+    assert operation.next_task_index == 1
+    assert operation.resume_available is False
+
+
 def test_same_explicit_directory_is_allocated_once_per_link():
     operation = make_operation(
         "files https://pan.baidu.com/s/1first 1234\n"
@@ -417,7 +635,24 @@ def test_null_passcode_result_is_rejected_before_updating_cookie():
     assert operation.network.headers["Cookie"] == "BAIDUID=test"
 
 
-def test_retry_exhaustion_logs_failure_and_continues_the_real_batch(monkeypatch):
+def test_standard_cookie_separators_do_not_break_passcode_verification():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    del operation.verify_link
+    operation.network.headers["Cookie"] = "BAIDUID=test; BDCLND=old; TOKEN=a=b internal value; "
+    operation.network.verify_pass_code = lambda *_args: "new"
+    operation.network.get_transfer_params = lambda *_args: json.dumps({
+        "shareid": 123, "share_uk": 456,
+        "fs_id": 789, "isdir": 0, "server_filename": "file",
+    })
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 1
+    assert operation.network.headers["Cookie"] == "BAIDUID=test;BDCLND=new;TOKEN=a=b internal value"
+    assert "转存成功" in operation.root.text_logs.value
+
+
+def test_retry_exhaustion_preserves_the_checkpoint_until_resumed(monkeypatch):
     operation = make_operation(
         "https://pan.baidu.com/s/1first 1234\n"
         "https://pan.baidu.com/s/1second 1234"
@@ -435,10 +670,100 @@ def test_retry_exhaustion_logs_failure_and_continues_the_real_batch(monkeypatch)
 
     operation.handle_process_save()
 
-    assert paths == ["/target/1"] * 5 + ["/target/2"]
-    assert operation.completed_task_count == 2
+    assert paths == ["/target/1"] * 5
+    assert operation.completed_task_count == 0
+    assert operation.resume_available is True
     assert "500" in operation.root.text_logs.value
     assert "第 5 次" in operation.root.text_logs.value
+
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert paths == ["/target/1"] * 6 + ["/target/2"]
+    assert operation.completed_task_count == 2
+
+
+@pytest.mark.parametrize("stage", ["verify", "create", "list"])
+def test_temporary_api_exhaustion_retains_current_item_at_every_stage(monkeypatch, stage):
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    attempts = []
+
+    def response(**_kwargs):
+        attempts.append(True)
+        return SimpleNamespace(json=lambda: {"errno": 500}, raise_for_status=lambda: None)
+
+    operation.network.s = SimpleNamespace(post=response, get=response)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    if stage == "verify":
+        del operation.verify_link
+    elif stage == "create":
+        del operation.network.create_dir
+    else:
+        operation.network.create_dir = lambda *_args: -8
+        del operation.network.get_dir_list
+
+    operation.handle_process_save()
+
+    assert len(attempts) == 5
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+    assert "500" in operation.root.text_logs.value
+
+    operation.verify_link = lambda *_args: VALID_RESULT
+    operation.network.create_dir = lambda *_args: 0
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 1
+
+
+def test_invalid_share_html_exhaustion_retains_the_batch_checkpoint(monkeypatch):
+    operation = make_operation("https://pan.baidu.com/s/1first")
+    del operation.verify_link
+    calls = []
+    valid_page = json.dumps({
+        "shareid": 123, "share_uk": 456,
+        "fs_id": 789, "isdir": 0, "server_filename": "file",
+    }).encode()
+
+    def get(**_kwargs):
+        calls.append(True)
+        body = b"<p>Busy</p>" if len(calls) <= 5 else valid_page
+        return SimpleNamespace(content=body, raise_for_status=lambda: None)
+
+    operation.network.s = SimpleNamespace(get=get)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    operation.handle_process_save()
+
+    assert len(calls) == 5
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 1
+
+
+def test_incomplete_directory_listing_does_not_start_a_partial_share_batch(monkeypatch):
+    operation = make_save_operation("")
+    del operation.network.get_dir_list
+    calls = []
+    responses = iter([{"errno": 0, "list": [], "has_more": 1}] * 5)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    operation.network.s = SimpleNamespace(
+        get=lambda **_kwargs: SimpleNamespace(
+            json=lambda: next(responses),
+            raise_for_status=lambda: None,
+        ),
+        close=lambda: None,
+    )
+    operation.network.create_share = lambda *_args: calls.append(True)
+    operation.share(SimpleNamespace(result=("永久", "1234", False)))
+
+    assert calls == []
+    assert "pagination" in operation.root.text_logs.value
 
 
 @pytest.mark.parametrize("invalid", [None, [], ["123"], ["123", "456", None, [], []]])
