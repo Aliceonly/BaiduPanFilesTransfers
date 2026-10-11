@@ -7,6 +7,7 @@
 """
 import json
 import random
+import threading
 import time
 from typing import Union, List, Any, Callable, Optional
 
@@ -24,6 +25,10 @@ NON_RETRYABLE_CODES = frozenset({
 })
 NON_RETRYABLE_TRANSFER_CODES = NON_RETRYABLE_CODES
 RetryCallback = Optional[Callable[[int, Any], None]]
+
+
+class RequestCancelledError(RuntimeError):
+    """A cancelled request must not start another retry."""
 
 
 class RetryExhaustedError(requests.RequestException):
@@ -62,6 +67,17 @@ class Network:
     @staticmethod
     def _sleep_before_retry() -> None:
         time.sleep(random.uniform(1, 2))
+
+    @staticmethod
+    def _check_cancelled(cancel_event: Optional[threading.Event]) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RequestCancelledError()
+
+    def _wait_before_retry(self, cancel_event: Optional[threading.Event]) -> None:
+        if cancel_event is None:
+            self._sleep_before_retry()
+        elif cancel_event.wait(random.uniform(1, 2)):
+            raise RequestCancelledError()
 
     def _request_json(
         self,
@@ -121,11 +137,14 @@ class Network:
         *,
         on_retry: RetryCallback = None,
         validator: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> str:
         """发送文本请求并在网络或 response 无效时 retry。"""
         for attempt in range(1, REQUEST_ATTEMPTS + 1):
+            self._check_cancelled(cancel_event)
             try:
                 response = request()
+                self._check_cancelled(cancel_event)
                 raise_for_status = getattr(response, 'raise_for_status', None)
                 if raise_for_status:
                     raise_for_status()
@@ -140,10 +159,11 @@ class Network:
                 return text
             except (requests.RequestException, ValueError, TypeError,
                     AttributeError, UnicodeError) as error:
+                self._check_cancelled(cancel_event)
                 if attempt == REQUEST_ATTEMPTS:
                     raise
                 self._notify_retry(on_retry, attempt, type(error).__name__)
-                self._sleep_before_retry()
+                self._wait_before_retry(cancel_event)
 
         raise RuntimeError('API retry loop unexpectedly ended')
 
@@ -193,6 +213,12 @@ class Network:
         all_items = []
         page = 1
         seen_pages = set()
+        seen_items = set()
+
+        def item_key(item):
+            if isinstance(item, dict) and item.get('fs_id') is not None:
+                return ('fs_id', str(item['fs_id']))
+            return ('record', json.dumps(item, sort_keys=True))
 
         def needs_next_page(payload, item_count):
             total = payload.get('total')
@@ -226,6 +252,11 @@ class Network:
                 if current:
                     if json.dumps(current, sort_keys=True) in seen_pages:
                         raise ValueError(f'目录 pagination 返回了重复页面：{page}')
+                    if (
+                        not any(item_key(item) not in seen_items for item in current)
+                        and needs_next_page(payload, len(all_items))
+                    ):
+                        raise ValueError(f'目录 pagination 没有新增内容但仍标记有后续数据：{page}')
                 elif needs_next_page(payload, len(all_items)):
                     raise ValueError(f'目录 pagination 返回空页面但仍标记有后续数据：{page}')
 
@@ -248,7 +279,11 @@ class Network:
             current = payload['list']
             if current:
                 seen_pages.add(json.dumps(current, sort_keys=True))
-            all_items.extend(current)
+            for item in current:
+                key = item_key(item)
+                if key not in seen_items:
+                    seen_items.add(key)
+                    all_items.append(item)
             if needs_next_page(payload, len(all_items)):
                 page += 1
                 continue
@@ -326,7 +361,12 @@ class Network:
             return payload['errno']
         return payload['randsk']
 
-    def get_transfer_params(self, url: str, on_retry: RetryCallback = None) -> str:
+    def get_transfer_params(
+        self,
+        url: str,
+        on_retry: RetryCallback = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> str:
         """请求分享页面，获取转存所需的原始 response。"""
         def validate(text):
             if not is_valid_transfer_params(parse_response(text)) and not is_permanent_share_error(text):
@@ -336,6 +376,7 @@ class Network:
             lambda: self.s.get(url=url, headers=self.headers, timeout=15, verify=False),
             on_retry=on_retry,
             validator=validate,
+            cancel_event=cancel_event,
         )
 
     def transfer_file(

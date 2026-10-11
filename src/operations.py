@@ -8,17 +8,19 @@
 
 import sys
 import inspect
+import re
 import threading
 import time
 import traceback
+from copy import deepcopy
 from collections import Counter
-from dataclasses import dataclass
-from typing import Union, List, Dict, Any, Tuple
+from dataclasses import dataclass, field
+from typing import Union, List, Dict, Any, Tuple, Optional
 
 import requests
 
 from src.constants import EXP_MAP, DELAY_SECONDS, INVALID_CHARS, ERROR_CODES, SAVE_LIMIT, COLOR_MAP
-from src.network import Network, RetryExhaustedError, UNKNOWN_RESULT
+from src.network import Network, RequestCancelledError, RetryExhaustedError, UNKNOWN_RESULT
 from src.ui import CustomDialog
 from src.utils import (
     thread_it,
@@ -33,15 +35,23 @@ from src.utils import (
 
 
 class RetryableTaskError(RuntimeError):
-    """当前任务的结果无法确认，必须保留 checkpoint 以便恢复。"""
+    """当前任务未完成或结果无法确认，必须保留 checkpoint 以便恢复。"""
 
 
 class PermanentTaskError(RuntimeError):
     """当前任务已确定失败，可以记录并推进到下一条。"""
 
 
-class CancellationRequested(RuntimeError):
+class CancellationRequested(RequestCancelledError):
     """窗口关闭或用户取消了 worker。"""
+
+
+@dataclass
+class CachedShare:
+    """Share parameters and the password authentication needed to reuse them."""
+
+    params: List[Any]
+    bdclnd: Optional[str] = None
 
 
 @dataclass
@@ -52,6 +62,7 @@ class UnknownTransferState:
     folder_name: str
     url_code: str
     baseline_items: List[Dict[str, Any]]
+    baseline_known: bool = True
 
 
 @dataclass
@@ -60,6 +71,8 @@ class PrefetchState:
 
     event: threading.Event
     cookie_generation: int
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    network: Optional[Network] = None
     result: Union[List[Any], int, None] = None
     error: Exception = None
 
@@ -84,7 +97,7 @@ class Operations:
         self.unknown_transfer_tasks = set()
         self.unknown_transfer_states: Dict[int, UnknownTransferState] = {}
         self.destination_baselines: Dict[str, List[Dict[str, Any]]] = {}
-        self.transfer_params_cache: Dict[Tuple[str, str], Union[List[Any], int]] = {}
+        self.transfer_params_cache: Dict[Tuple[str, str], CachedShare] = {}
         self.prefetch_states: Dict[Tuple[str, str], PrefetchState] = {}
         self.cookie_generation = 0
         self.saved_links = set()
@@ -96,6 +109,7 @@ class Operations:
         self.resume_available = False
         self.running = False
         self._run_lock = threading.Lock()
+        self._prefetch_lock = threading.Lock()
         self._ui_thread = threading.current_thread()
         self.cancel_event = threading.Event()
         self.worker_thread = None
@@ -128,10 +142,24 @@ class Operations:
         """通知 worker 尽快退出，暂停等待也会被立即唤醒。"""
         self.cancel_event.set()
         self.running = False
+        self._cancel_prefetch()
         try:
             self.network.s.close()
         except Exception:
             pass
+
+    def _cancel_prefetch(self) -> None:
+        """Cancel each worker independently so a resume cannot revive old retries."""
+        with self._prefetch_lock:
+            states = list(self.prefetch_states.values())
+            for state in states:
+                state.cancel_event.set()
+        for state in states:
+            if state.network is not None:
+                try:
+                    state.network.s.close()
+                except Exception:
+                    pass
 
     def _ui_call(self, callback, *args) -> None:
         """把 Tk 操作切回创建窗口的 UI thread。"""
@@ -235,6 +263,7 @@ class Operations:
             self.insert_logs(f'程序出现未预料错误，信息如下：\n{e}\n{traceback.format_exc()}')
         finally:
             self.resume_available = can_resume and self.next_task_index < len(self.link_list)
+            self._cancel_prefetch()
             try:
                 try:
                     self.network.s.close()
@@ -289,6 +318,11 @@ class Operations:
 
     def prepare_run(self, resume: bool = False) -> None:
         """获取变量，准备运行。转存和分享共用逻辑"""
+        self._cancel_prefetch()
+        with self._prefetch_lock:
+            self.prefetch_states.clear()
+        self.transfer_params_cache.clear()
+        self.cookie_generation += 1
         # Cookie 输入框只去除外层空白，Cookie 内部的分隔符和值不能被改写。
         user_cookie = self._input_value(
             'cookie', lambda: self.root.entry_cookie.get()
@@ -298,7 +332,6 @@ class Operations:
                 self.network.headers['Cookie'] = user_cookie
                 self.cookie = user_cookie
                 self.batch_cookie = user_cookie
-                self.cookie_generation += 1
             else:
                 self.cookie = self.network.headers.get('Cookie', user_cookie)
             self.network.reset_session()
@@ -322,9 +355,6 @@ class Operations:
             self.unknown_transfer_tasks = set()
             self.unknown_transfer_states = {}
             self.destination_baselines = {}
-            self.transfer_params_cache = {}
-            self.prefetch_states = {}
-            self.cookie_generation = 0
             self.saved_links = set()
             self.link_list = []
             self.link_list_org = []
@@ -487,7 +517,7 @@ class Operations:
         except CancellationRequested:
             raise
         except RetryableTaskError as e:
-            self.insert_logs(f'当前任务结果未知，保留断点：{e}：{url_code}')
+            self.insert_logs(f'当前任务暂未完成，保留断点：{e}：{url_code}')
             return False
         except PermanentTaskError as e:
             if self.next_task_index in self.unknown_transfer_tasks:
@@ -640,7 +670,9 @@ class Operations:
         if prefetch is not None:
             while not prefetch.event.wait(DELAY_SECONDS):
                 self._check_cancelled()
-            self.prefetch_states.pop(cache_key, None)
+            self._check_cancelled()
+            with self._prefetch_lock:
+                self.prefetch_states.pop(cache_key, None)
             if prefetch.cookie_generation != self.cookie_generation:
                 # A password verification changed BDCLND while this page was
                 # being fetched. Retry it with the current main Session.
@@ -649,10 +681,29 @@ class Operations:
                 raise RetryableTaskError(
                     f'获取分享页面请求失败：{prefetch.error}'
                 ) from prefetch.error
-            self.transfer_params_cache[cache_key] = prefetch.result
+            if not is_valid_transfer_params(prefetch.result):
+                return prefetch.result
+            self.transfer_params_cache[cache_key] = CachedShare(prefetch.result)
         if cache_key not in self.transfer_params_cache:
-            self.transfer_params_cache[cache_key] = self.verify_link(url, password)
-        return self.transfer_params_cache[cache_key]
+            result = self.verify_link(url, password)
+            if not is_valid_transfer_params(result):
+                return result
+            bdclnd = None
+            if password:
+                bdclnd = next((
+                    field.strip().partition('=')[2]
+                    for field in self.network.headers.get('Cookie', '').split(';')
+                    if field.strip().partition('=')[0] == 'BDCLND'
+                ), None)
+            self.transfer_params_cache[cache_key] = CachedShare(result, bdclnd)
+        cached = self.transfer_params_cache[cache_key]
+        if cached.bdclnd is not None:
+            cookie = self.network.headers['Cookie']
+            restored = update_cookie(cached.bdclnd, cookie)
+            if restored != cookie:
+                self.network.headers['Cookie'] = restored
+                self.cookie_generation += 1
+        return cached.params
 
     def schedule_prefetch(self, start_index: int) -> None:
         """后台预取后续无提取码链接，主 worker 仍按输入顺序转存。"""
@@ -679,30 +730,39 @@ class Operations:
                 event=threading.Event(),
                 cookie_generation=self.cookie_generation,
             )
-            self.prefetch_states[cache_key] = state
+            with self._prefetch_lock:
+                if self.cancel_event.is_set():
+                    return
+                self.prefetch_states[cache_key] = state
             thread_it(self._prefetch_transfer_params, url, state)
             pending_count += 1
 
     def _prefetch_transfer_params(self, url: str, state: PrefetchState) -> None:
         """用独立 Session 预取无提取码分享页，避免并发操作主 Session。"""
-        network = Network()
+        network = None
         try:
-            if self.cancel_event.is_set():
-                state.error = CancellationRequested()
-                return
-            network.headers = self.network.headers.copy()
-            network.bdstoken = self.network.bdstoken
-            network.s.trust_env = self.network.s.trust_env
+            with self._prefetch_lock:
+                if state.cancel_event.is_set() or self.cancel_event.is_set():
+                    raise CancellationRequested()
+                network = Network()
+                state.network = network
+                network.headers = self.network.headers.copy()
+                network.bdstoken = self.network.bdstoken
+                network.s.trust_env = self.network.s.trust_env
             response = network.get_transfer_params(
                 url,
                 on_retry=self._retry_log,
+                cancel_event=state.cancel_event,
             )
+            if state.cancel_event.is_set():
+                raise CancellationRequested()
             state.result = parse_response(response)
         except Exception as error:
             state.error = error
         finally:
             try:
-                network.s.close()
+                if network is not None:
+                    network.s.close()
             finally:
                 state.event.set()
 
@@ -861,9 +921,22 @@ class Operations:
     def transfer_with_logs(self, params: List[Any], folder_name: str, url_code: str) -> Union[int, str]:
         """记录每次重试；重试期间使用相同的链接与目录。"""
         task_key = self.next_task_index
+        baseline_known = True
         if task_key in self.unknown_transfer_states:
             if self.verify_unknown_transfer(task_key):
                 return 0
+        elif not self.custom_mode and self._expected_transfer_items(params) is not None:
+            # The batch-start snapshot may predate writes from another client.
+            # Custom paths already have a confirmed empty baseline at creation.
+            try:
+                baseline = self._network_call(
+                    self.network.get_dir_list, f'/{folder_name}',
+                )
+            except RetryableTaskError:
+                baseline = None
+            baseline_known = isinstance(baseline, list)
+            if baseline_known:
+                self.destination_baselines[folder_name] = list(baseline)
 
         def on_retry(attempt, reason):
             self.insert_logs(f'转存失败（{reason}），正在第 {attempt} 次尝试：{url_code}')
@@ -871,14 +944,15 @@ class Operations:
         try:
             result = self.network.transfer_file(params, folder_name, on_retry=on_retry)
         except RetryExhaustedError as error:
-            self._remember_unknown_transfer(task_key, params, folder_name, url_code)
-            if self.verify_unknown_transfer(task_key):
-                return 0
+            # Explicit errno responses do not imply that a write was applied.
+            # Preserve a previous ambiguity, but do not invent a new one.
             raise RetryableTaskError(f'转存请求失败：{error}') from error
         except requests.RequestException:
             result = UNKNOWN_RESULT
         if result == UNKNOWN_RESULT:
-            self._remember_unknown_transfer(task_key, params, folder_name, url_code)
+            self._remember_unknown_transfer(
+                task_key, params, folder_name, url_code, baseline_known=baseline_known,
+            )
             if self.verify_unknown_transfer(task_key):
                 return 0
         elif result == 0:
@@ -896,13 +970,18 @@ class Operations:
         params: List[Any],
         folder_name: str,
         url_code: str,
+        baseline_known: bool = True,
     ) -> None:
         self.unknown_transfer_tasks.add(task_key)
-        self.unknown_transfer_states[task_key] = UnknownTransferState(
-            params=params,
-            folder_name=folder_name,
-            url_code=url_code,
-            baseline_items=list(self.destination_baselines.get(folder_name, [])),
+        self.unknown_transfer_states.setdefault(
+            task_key,
+            UnknownTransferState(
+                params=deepcopy(params),
+                folder_name=folder_name,
+                url_code=url_code,
+                baseline_items=deepcopy(self.destination_baselines.get(folder_name, [])),
+                baseline_known=baseline_known,
+            ),
         )
 
     @staticmethod
@@ -913,24 +992,53 @@ class Operations:
             str(item.get('isdir', '0')),
         )
 
-    def _expected_transfer_items(self, params: List[Any]) -> Counter:
-        return Counter(
-            (str(filename), str(isdir))
-            for filename, isdir in zip(params[3], params[4])
-        )
+    @staticmethod
+    def _source_transfer_items(params: List[Any]) -> List[Dict[str, Any]]:
+        metadata = getattr(params, 'item_metadata', [])
+        if not isinstance(metadata, list) or len(metadata) != len(params[2]):
+            metadata = [{} for _ in params[2]]
+        return [
+            {**(extra if isinstance(extra, dict) else {}), 'server_filename': filename, 'isdir': isdir}
+            for filename, isdir, extra in zip(params[3], params[4], metadata)
+        ]
+
+    @classmethod
+    def _transfer_item_signature(cls, item: Dict[str, Any]) -> Optional[Tuple]:
+        """Names alone, including top-level directories, cannot prove completion."""
+        name, isdir = cls._transfer_item_key(item)
+        size = item.get('size')
+        md5 = item.get('md5')
+        if (
+            not isinstance(item.get('server_filename'), str) or not name
+            or 'isdir' not in item or isdir != '0'
+            or isinstance(size, bool) or not isinstance(size, (int, str))
+            or len(str(size)) > 20 or not str(size).isascii() or not str(size).isdigit()
+            or not isinstance(md5, str) or not re.fullmatch(r'[a-fA-F0-9]{32}', md5)
+        ):
+            return None
+        return name, isdir, int(size), md5.lower()
+
+    def _expected_transfer_items(self, params: List[Any]) -> Optional[Counter]:
+        signatures = [
+            self._transfer_item_signature(item)
+            for item in self._source_transfer_items(params)
+        ]
+        if not signatures or any(signature is None for signature in signatures):
+            return None
+        return Counter(signatures)
 
     def _remember_transfer_items(self, folder_name: str, params: List[Any]) -> None:
         """Update the baseline after a confirmed transfer without another list call."""
         baseline = self.destination_baselines.setdefault(folder_name, [])
-        baseline.extend(
-            {'server_filename': filename, 'isdir': isdir}
-            for filename, isdir in zip(params[3], params[4])
-        )
+        baseline.extend(self._source_transfer_items(params))
 
     def verify_unknown_transfer(self, task_key: int) -> bool:
         """Check whether an ambiguous transfer is already visible in its target."""
         state = self.unknown_transfer_states.get(task_key)
-        if state is None:
+        if state is None or not state.baseline_known:
+            return False
+        expected_counts = self._expected_transfer_items(state.params)
+        if expected_counts is None:
             return False
 
         try:
@@ -948,16 +1056,37 @@ class Operations:
             for item in state.baseline_items
             if isinstance(item, dict)
         )
-        current_counts = Counter(
-            self._transfer_item_key(item)
-            for item in current
-            if isinstance(item, dict)
-        )
-        new_counts = current_counts - baseline_counts
-        expected_counts = self._expected_transfer_items(state.params)
+        baseline_ids = {
+            str(item['fs_id']) for item in state.baseline_items
+            if isinstance(item, dict) and item.get('fs_id') is not None
+        }
+        new_counts = Counter()
+        seen_ids = set()
+        for item in current:
+            if not isinstance(item, dict):
+                continue
+            fs_id = item.get('fs_id')
+            if (
+                isinstance(fs_id, bool) or not isinstance(fs_id, (int, str))
+                or not str(fs_id).isascii() or not str(fs_id).isdigit()
+            ):
+                continue
+            signature = self._transfer_item_signature(item)
+            identity = str(fs_id)
+            if identity in seen_ids:
+                continue
+            seen_ids.add(identity)
+            if str(fs_id) in baseline_ids:
+                baseline_counts[self._transfer_item_key(item)] -= 1
+                continue
+            if signature is not None:
+                new_counts[signature] += 1
+
+        # Baseline entries without a target fs_id include confirmed earlier
+        # transfers. Reserve their name counts rather than reusing them as proof.
         confirmed = all(
-            new_counts[item_key] >= count
-            for item_key, count in expected_counts.items()
+            new_counts[signature] >= count + max(baseline_counts[signature[:2]], 0)
+            for signature, count in expected_counts.items()
         )
         if not confirmed:
             return False

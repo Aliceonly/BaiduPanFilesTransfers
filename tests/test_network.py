@@ -1,7 +1,10 @@
+import json
+import threading
+
 import pytest
 import requests
 
-from src.network import Network, UNKNOWN_RESULT
+from src.network import Network, RequestCancelledError, UNKNOWN_RESULT
 from src.utils import parse_response, parse_url_and_code
 
 
@@ -281,6 +284,67 @@ def test_invalid_share_page_exhaustion_is_not_returned_as_a_dead_link(monkeypatc
     assert network.s.calls == 5
 
 
+def test_cancelled_share_page_does_not_send_a_request():
+    network = Network()
+    network.s = FakeSession([])
+    cancelled = threading.Event()
+    cancelled.set()
+
+    with pytest.raises(RequestCancelledError):
+        network.get_transfer_params("https://pan.baidu.com/s/1first", cancel_event=cancelled)
+
+    assert network.s.calls == 0
+
+
+def test_share_page_retry_wait_is_interruptible(monkeypatch):
+    network = Network()
+    network.s = FakeSession([requests.Timeout("timeout"), FakeResponse(0, content=SHARE_PAGE)])
+    cancelled = threading.Event()
+    monkeypatch.setattr("src.network.time.sleep", lambda *_args: pytest.fail("non-interruptible wait"))
+
+    with pytest.raises(RequestCancelledError):
+        network.get_transfer_params(
+            "https://pan.baidu.com/s/1first",
+            on_retry=lambda *_args: cancelled.set(),
+            cancel_event=cancelled,
+        )
+
+    assert network.s.calls == 1
+
+
+def test_cancelling_during_a_retry_wait_wakes_the_request_worker(monkeypatch):
+    network = Network()
+    network.s = FakeSession([requests.Timeout("timeout")])
+    waiting = threading.Event()
+    errors = []
+
+    class CancellationEvent(threading.Event):
+        def wait(self, timeout=None):
+            waiting.set()
+            return super().wait(timeout)
+
+    cancelled = CancellationEvent()
+    monkeypatch.setattr("src.network.random.uniform", lambda *_args: 60)
+
+    def request():
+        try:
+            network.get_transfer_params("https://pan.baidu.com/s/1first", cancel_event=cancelled)
+        except RequestCancelledError as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=request, daemon=True)
+    thread.start()
+    try:
+        assert waiting.wait(2)
+    finally:
+        cancelled.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert network.s.calls == 1
+
+
 @pytest.mark.parametrize("message", ["分享已取消", "分享的文件已经被删除了", "链接已失效"])
 def test_confirmed_unavailable_share_page_does_not_retry(message):
     network = Network()
@@ -305,6 +369,53 @@ def test_get_dir_list_reads_all_pages():
     assert len(result) == 1001
     assert network.s.requests[0]["params"]["page"] == "1"
     assert network.s.requests[1]["params"]["page"] == "2"
+
+
+def test_pagination_deduplicates_overlapping_items_and_uses_unique_total():
+    first = [{"fs_id": index} for index in range(1000)]
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, {"errno": 0, "list": first, "total": 1002}),
+        FakeResponse(0, {"errno": 0, "list": [{"fs_id": "999"}, {"fs_id": "1000"}], "total": 1002}),
+        FakeResponse(0, {"errno": 0, "list": [{"fs_id": "1001"}], "total": 1002}),
+    ])
+
+    result = network.get_dir_list("/target")
+
+    assert len(result) == 1002
+    assert len({str(item["fs_id"]) for item in result}) == 1002
+    assert result[-1] == {"fs_id": "1001"}
+    assert [request["params"]["page"] for request in network.s.requests] == ["1", "2", "3"]
+
+
+def test_pagination_retries_an_overlap_only_page_without_claiming_completion(monkeypatch):
+    first = [{"fs_id": index} for index in range(1000)]
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, {"errno": 0, "list": first, "total": 1001}),
+        FakeResponse(0, {"errno": 0, "list": [{"fs_id": 999}], "total": 1001}),
+        FakeResponse(0, {"errno": 0, "list": [{"fs_id": 1000}], "total": 1001}),
+    ])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    result = network.get_dir_list("/target")
+
+    assert len(result) == 1001
+    assert result[-1] == {"fs_id": 1000}
+    assert [request["params"]["page"] for request in network.s.requests] == ["1", "2", "2"]
+
+
+def test_pagination_uses_canonical_records_when_file_ids_are_unavailable():
+    first = {"server_filename": "first", "isdir": 0}
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, {"errno": 0, "list": [first, dict(first)], "total": 2}),
+        FakeResponse(0, {"errno": 0, "list": [
+            {"isdir": 0, "server_filename": "first"}, {"server_filename": "second", "isdir": 0},
+        ], "total": 2}),
+    ])
+
+    assert network.get_dir_list("/target") == [first, {"server_filename": "second", "isdir": 0}]
 
 
 @pytest.mark.parametrize("errno", [-9, -6, 4])
@@ -424,6 +535,39 @@ def test_parse_response_deduplicates_embedded_file_records():
     response = f'{{"shareid":1,"share_uk":"2","list":[{record},{record}]}}'
 
     assert parse_response(response) == ["1", "2", ["3"], ["one"], ["0"]]
+
+
+def test_parse_response_keeps_file_metadata_with_its_own_record():
+    first = {"fs_id": 3, "isdir": 0, "server_filename": "{one}", "size": 100, "md5": "a" * 32}
+    second = {"fs_id": 4, "isdir": 0, "server_filename": "two"}
+    page = json.dumps({"size": 999, "md5": "unrelated", "shareid": 1, "share_uk": 2,
+                       "list": [first, second, first, second]})
+
+    result = parse_response(page)
+
+    assert result == ["1", "2", ["3", "4"], ["{one}", "two"], ["0", "0"]]
+    assert result.item_metadata == [{"size": 100, "md5": "a" * 32}, {}]
+
+
+def test_parse_response_discards_conflicting_metadata_for_duplicate_file_ids():
+    first = {"fs_id": 3, "isdir": 0, "server_filename": "one", "size": 100, "md5": "a" * 32}
+    second = {**first, "size": 200}
+    page = json.dumps({"shareid": 1, "share_uk": 2, "list": [first, second]})
+
+    assert parse_response(page).item_metadata == [{}]
+
+
+def test_parse_response_reads_metadata_from_nested_share_page_json():
+    record = {"fs_id": 3, "isdir": 0, "server_filename": "one", "size": 100, "md5": "a" * 32,
+              "thumbs": {"url1": "https://example.invalid/image"}}
+    page = '<script>var settings = {invalid: true}; var share = ' + json.dumps({
+        "shareid": 1, "share_uk": 2, "file_list": {"list": [record]},
+    }) + ';</script>'
+
+    result = parse_response(page)
+
+    assert result == ["1", "2", ["3"], ["one"], ["0"]]
+    assert result.item_metadata == [{"size": 100, "md5": "a" * 32}]
 
 
 def test_parse_response_keeps_distinct_files_with_the_same_display_name():

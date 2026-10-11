@@ -16,7 +16,7 @@ import string
 import tempfile
 import threading
 import zlib
-from typing import Any, Union, Tuple, Callable, List, Optional
+from typing import Any, Union, Tuple, Callable, List, Optional, Dict
 
 from src.constants import CONFIG_PATH, ICON_BASE64
 
@@ -26,6 +26,18 @@ USER_ID_REGEX = re.compile(r'"share_uk"\s*:\s*"?(\d+)"?\s*[,}]')
 FS_ID_REGEX = re.compile(r'"fs_id"\s*:\s*"?(\d+)"?\s*[,}]')
 SERVER_FILENAME_REGEX = re.compile(r'"server_filename"\s*:\s*("(?:[^"\\]|\\.)*")\s*[,}]')
 ISDIR_REGEX = re.compile(r'"isdir"\s*:\s*([01])\s*[,}]')
+
+
+class TransferParams(list):
+    """Backward-compatible transfer params with optional source metadata."""
+
+    def __init__(
+        self,
+        values: List[Any],
+        item_metadata: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__(values)
+        self.item_metadata = item_metadata or []
 
 
 def thread_it(func: Callable, *args: Tuple[Any, ...]) -> threading.Thread:
@@ -171,11 +183,54 @@ def parse_response(response: str) -> Union[List[Any], int]:
     except (ValueError, TypeError):
         return -1
 
-    params = [
+    values = [
         shareid_list[0], user_id_list[0], list(files),
-        [info[0] for info in files.values()], [info[1] for info in files.values()],
+        [info[0] for info in files.values()],
+        [info[1] for info in files.values()],
     ]
-    return params if is_valid_transfer_params(params) else -1
+    if not is_valid_transfer_params(values):
+        return -1
+
+    # Metadata must belong to the same JSON record, not an unrelated page field.
+    metadata_by_id = {}
+    decoder = json.JSONDecoder()
+    offset = 0
+    while True:
+        start = response.find('{', offset)
+        if start == -1:
+            break
+        try:
+            value, offset = decoder.raw_decode(response, start)
+        except (ValueError, RecursionError):
+            offset = start + 1
+            continue
+        pending = [value]
+        while pending:
+            record = pending.pop()
+            if isinstance(record, list):
+                pending.extend(record)
+                continue
+            if not isinstance(record, dict):
+                continue
+            pending.extend(
+                child for child in record.values() if isinstance(child, (dict, list))
+            )
+            fs_id = str(record.get('fs_id', ''))
+            if fs_id not in files or (
+                record.get('server_filename'), str(record.get('isdir'))
+            ) != files[fs_id]:
+                continue
+            metadata = {
+                name: record[name] for name in ('size', 'md5') if name in record
+            }
+            if fs_id not in metadata_by_id:
+                metadata_by_id[fs_id] = metadata
+            elif metadata_by_id[fs_id] != metadata:
+                metadata_by_id[fs_id] = {}
+    return TransferParams(
+        values,
+        [metadata_by_id.get(fs_id, {}) for fs_id in files],
+    )
 
 
 def is_valid_transfer_params(params: Any) -> bool:

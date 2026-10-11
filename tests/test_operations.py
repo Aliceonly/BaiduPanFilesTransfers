@@ -3,12 +3,16 @@ import threading
 import json
 
 import pytest
+import requests
 
-from src.network import UNKNOWN_RESULT
-from src.operations import CancellationRequested, Operations
+from src.network import Network, RequestCancelledError, UNKNOWN_RESULT
+from src.operations import CancellationRequested, Operations, PrefetchState
+from src.utils import TransferParams
 
 
 VALID_RESULT = ["123", "456", ["789"], ["file"], ["0"]]
+FILE_MD5 = "a" * 32
+VERIFIABLE_RESULT = TransferParams(VALID_RESULT, [{"size": 100, "md5": FILE_MD5}])
 
 
 class DummyText:
@@ -147,12 +151,13 @@ def test_unknown_transfer_result_keeps_current_directory_and_checkpoint():
 
 def test_unknown_transfer_is_confirmed_by_target_directory_listing():
     operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
     transfers = []
     operation.network.transfer_file = (
         lambda _params, path, **_kwargs: transfers.append(path) or UNKNOWN_RESULT
     )
     operation.network.get_dir_list = lambda _path: [
-        {"server_filename": "file", "isdir": 0, "fs_id": "900"},
+        {"server_filename": "file", "isdir": 0, "fs_id": "900", "size": "100", "md5": FILE_MD5.upper()},
     ]
 
     operation.handle_process_save()
@@ -166,10 +171,11 @@ def test_unknown_transfer_is_confirmed_by_target_directory_listing():
 
 def test_unknown_transfer_rechecks_before_sending_a_duplicate_request():
     operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
     transfers = []
     listings = iter([
         [],
-        [{"server_filename": "file", "isdir": 0, "fs_id": "900"}],
+        [{"server_filename": "file", "isdir": 0, "fs_id": "900", "size": 100, "md5": FILE_MD5}],
     ])
     operation.network.transfer_file = (
         lambda _params, path, **_kwargs: transfers.append(path) or UNKNOWN_RESULT
@@ -189,13 +195,14 @@ def test_unknown_transfer_rechecks_before_sending_a_duplicate_request():
 
 def test_normal_mode_unknown_verification_ignores_preexisting_same_name():
     operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
     operation.custom_mode = False
     operation.destination_baselines["target"] = [
-        {"server_filename": "file", "isdir": 0, "fs_id": "before"},
+        {"server_filename": "file", "isdir": 0, "fs_id": "before", "size": 100, "md5": FILE_MD5},
     ]
     operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
     operation.network.get_dir_list = lambda _path: [
-        {"server_filename": "file", "isdir": 0, "fs_id": "before"},
+        {"server_filename": "file", "isdir": 0, "fs_id": "before", "size": 100, "md5": FILE_MD5},
     ]
 
     operation.handle_process_save()
@@ -203,6 +210,172 @@ def test_normal_mode_unknown_verification_ignores_preexisting_same_name():
     assert operation.next_task_index == 0
     assert operation.resume_available is True
     assert operation.unknown_transfer_tasks == {0}
+
+
+@pytest.mark.parametrize("metadata", [
+    {}, {"size": 100}, {"size": 101, "md5": FILE_MD5},
+    {"size": 100, "md5": "b" * 32}, {"size": True, "md5": FILE_MD5},
+    {"size": 100, "md5": "invalid"}, {"size": 100, "md5": FILE_MD5, "fs_id": None},
+    {"size": 100, "md5": FILE_MD5, "fs_id": ""},
+])
+def test_unknown_transfer_cannot_be_confirmed_by_a_name_or_wrong_content(metadata):
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.network.get_dir_list = lambda _path: [
+        {"server_filename": "file", "isdir": 0, "fs_id": "900", **metadata},
+    ]
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+    assert operation.unknown_transfer_tasks == {0}
+    assert "已自动核对" not in operation.root.text_logs.value
+
+
+def test_unknown_transfer_target_must_include_an_explicit_file_type():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.network.get_dir_list = lambda _path: [
+        {"server_filename": "file", "fs_id": 900, "size": 100, "md5": FILE_MD5},
+    ]
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+    assert operation.unknown_transfer_tasks == {0}
+
+
+@pytest.mark.parametrize("isdir", ["0", "1"])
+def test_unknown_transfer_with_insufficient_source_metadata_keeps_checkpoint(isdir):
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    params = TransferParams(["123", "456", ["789"], ["file"], [isdir]])
+    operation.verify_link = lambda *_args: params
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.network.get_dir_list = lambda _path: [
+        {"server_filename": "file", "isdir": int(isdir), "size": 100, "md5": FILE_MD5},
+    ]
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+    assert operation.pending_custom_dirs == {0: "target/1"}
+
+
+def test_unknown_directory_is_not_confirmed_by_top_level_metadata():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.verify_link = lambda *_args: TransferParams(
+        ["123", "456", ["789"], ["file"], ["1"]],
+        [{"size": 100, "md5": FILE_MD5}],
+    )
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.network.get_dir_list = lambda _path: [
+        {"server_filename": "file", "isdir": 1, "size": 100, "md5": FILE_MD5},
+    ]
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+    assert operation.unknown_transfer_tasks == {0}
+
+
+def test_unknown_transfer_requires_all_expected_files_with_distinct_target_ids():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.verify_link = lambda *_args: TransferParams(
+        ["123", "456", ["789", "790"], ["file", "file"], ["0", "0"]],
+        [{"size": 100, "md5": FILE_MD5}] * 2,
+    )
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    item = {"server_filename": "file", "isdir": 0, "fs_id": 900, "size": 100, "md5": FILE_MD5}
+    operation.network.get_dir_list = lambda _path: [item, dict(item)]
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+
+
+def test_unknown_transfer_does_not_reuse_a_previous_confirmed_transfer_as_proof():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.custom_mode = False
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    operation._remember_transfer_items("target", VERIFIABLE_RESULT)
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.network.get_dir_list = lambda _path: [
+        {"server_filename": "file", "isdir": 0, "fs_id": 900, "size": 100, "md5": FILE_MD5},
+    ]
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+
+
+def test_unknown_transfer_keeps_its_original_source_snapshot_after_resume():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.transfer_with_logs(VERIFIABLE_RESULT, "target/1", "url")
+    changed = TransferParams(VALID_RESULT, [{"size": 200, "md5": "b" * 32}])
+    operation.network.get_dir_list = lambda _path: [
+        {"server_filename": "file", "isdir": 0, "fs_id": 900, "size": 200, "md5": "b" * 32},
+    ]
+
+    assert operation.transfer_with_logs(changed, "target/1", "url") == UNKNOWN_RESULT
+    assert operation.unknown_transfer_states[0].params.item_metadata == VERIFIABLE_RESULT.item_metadata
+
+
+def test_normal_mode_refreshes_its_baseline_before_sending_the_transfer():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.custom_mode = False
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    calls = []
+    item = {"server_filename": "file", "isdir": 0, "fs_id": 900, "size": 100, "md5": FILE_MD5}
+    operation.network.get_dir_list = lambda _path: calls.append("list") or [item]
+    operation.network.transfer_file = lambda *_args, **_kwargs: calls.append("transfer") or UNKNOWN_RESULT
+
+    operation.handle_process_save()
+
+    assert calls == ["list", "transfer", "list"]
+    assert operation.next_task_index == 0
+    assert operation.unknown_transfer_tasks == {0}
+
+
+def test_normal_mode_confirms_only_content_added_after_the_fresh_baseline():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.custom_mode = False
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    listings = iter([
+        [], [{"server_filename": "file", "isdir": 0, "fs_id": 900, "size": 100, "md5": FILE_MD5}],
+    ])
+    operation.network.get_dir_list = lambda _path: next(listings)
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 1
+    assert operation.unknown_transfer_tasks == set()
+
+
+@pytest.mark.parametrize("snapshot_result", [-6, requests.Timeout("timeout")])
+def test_failed_normal_mode_snapshot_disables_automatic_confirmation(snapshot_result):
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.custom_mode = False
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+
+    def listing(_path):
+        if isinstance(snapshot_result, Exception):
+            raise snapshot_result
+        return snapshot_result
+
+    operation.network.get_dir_list = listing
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.handle_process_save()
+    operation.network.get_dir_list = lambda _path: [
+        {"server_filename": "file", "isdir": 0, "fs_id": 900, "size": 100, "md5": FILE_MD5},
+    ]
+
+    assert operation.verify_unknown_transfer(0) is False
+    assert operation.next_task_index == 0
+    assert not operation.unknown_transfer_states[0].baseline_known
 
 
 def test_verified_transfer_parameters_are_cached_across_title_rows():
@@ -221,6 +394,71 @@ def test_verified_transfer_parameters_are_cached_across_title_rows():
     assert operation.completed_task_count == 2
 
 
+def test_password_share_cache_restores_bdclnd_for_a_b_a_sequence():
+    operation = make_operation(
+        "https://pan.baidu.com/s/1alpha 1234\n"
+        "https://pan.baidu.com/s/1bravo 5678\n"
+        "https://pan.baidu.com/s/1alpha 1234"
+    )
+    del operation.verify_link
+    verified = []
+    transferred = []
+
+    def verify(url, _password):
+        name = "alpha" if url.endswith("alpha") else "bravo"
+        verified.append(name)
+        return name
+
+    def page(url):
+        file_id = 11 if url.endswith("alpha") else 22
+        return json.dumps({
+            "shareid": file_id, "share_uk": 2,
+            "fs_id": file_id, "server_filename": str(file_id), "isdir": 0,
+        })
+
+    def transfer(params, path, **_kwargs):
+        expected = "alpha" if params[0] == "11" else "bravo"
+        cookie = operation.network.headers["Cookie"]
+        transferred.append((path, cookie))
+        return 0 if f"BDCLND={expected}" in cookie else -12
+
+    operation.network.verify_pass_code = verify
+    operation.network.get_transfer_params = page
+    operation.network.transfer_file = transfer
+    operation.handle_process_save()
+
+    assert verified == ["alpha", "bravo"]
+    assert "BDCLND=alpha" in transferred[2][1]
+    assert operation.root.text_logs.value.count("转存成功") == 3
+
+
+@pytest.mark.parametrize("first_result", [-6, -9, None, []])
+def test_share_verification_errors_are_not_cached(first_result):
+    operation = make_operation("")
+    results = iter([first_result, VALID_RESULT])
+    verified = []
+    operation.verify_link = lambda *_args: verified.append(True) or next(results)
+
+    assert operation.get_cached_transfer_params("https://pan.baidu.com/s/1first 1234") == first_result
+    assert operation.get_cached_transfer_params("https://pan.baidu.com/s/1first 1234") == VALID_RESULT
+    assert len(verified) == 2
+
+
+@pytest.mark.parametrize("replace_cookie", [True, False])
+def test_resuming_refreshes_cached_share_authentication_and_metadata(replace_cookie):
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    verified = []
+    operation.verify_link = lambda *_args: verified.append(True) or VALID_RESULT
+    operation.get_cached_transfer_params(operation.link_list[0])
+    if replace_cookie:
+        operation.root.entry_cookie.value = "BAIDUID=refreshed"
+
+    operation.prepare_run(resume=True)
+    operation.get_cached_transfer_params(operation.link_list[0])
+
+    assert len(verified) == 2
+
+
 def test_no_password_pages_are_prefetched_with_an_isolated_session(monkeypatch):
     operation = make_operation(
         "https://pan.baidu.com/s/no-password\n"
@@ -236,7 +474,7 @@ def test_no_password_pages_are_prefetched_with_an_isolated_session(monkeypatch):
             self.s = SimpleNamespace(trust_env=False, close=lambda: None)
             created.append(self)
 
-        def get_transfer_params(self, _url, on_retry=None):
+        def get_transfer_params(self, _url, on_retry=None, cancel_event=None):
             return json.dumps({
                 "shareid": 123,
                 "share_uk": 456,
@@ -261,6 +499,91 @@ def test_no_password_pages_are_prefetched_with_an_isolated_session(monkeypatch):
 
     assert result == VALID_RESULT
     assert len(created) == 1
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_prefetch_cancellation_stops_old_worker_retries_even_after_resume(monkeypatch, resume):
+    operation = make_operation("https://pan.baidu.com/s/no-password")
+    operation.network.bdstoken = "token"
+    started = threading.Event()
+    released = threading.Event()
+    threads = []
+    requests_sent = []
+    closed = []
+
+    class PrefetchNetwork(Network):
+        def __init__(self):
+            super().__init__()
+            self.s.close()
+            self.s = SimpleNamespace(trust_env=False, get=self.get, close=self.close)
+
+        def get(self, **_kwargs):
+            requests_sent.append(True)
+            started.set()
+            assert released.wait(2)
+            raise requests.Timeout("cancelled in-flight request")
+
+        def close(self):
+            closed.append(True)
+            released.set()
+
+    def run_thread(func, *args):
+        thread = threading.Thread(target=func, args=args, daemon=True)
+        threads.append(thread)
+        thread.start()
+        return thread
+
+    monkeypatch.setattr("src.operations.Network", PrefetchNetwork)
+    monkeypatch.setattr("src.operations.thread_it", run_thread)
+    operation.schedule_prefetch(0)
+    state = next(iter(operation.prefetch_states.values()))
+    assert started.wait(2)
+
+    if resume:
+        operation.prepare_run(resume=True)
+    else:
+        operation.request_cancel()
+        operation.cancel_event.clear()
+    threads[0].join(timeout=2)
+
+    assert not threads[0].is_alive()
+    assert state.cancel_event.is_set()
+    assert state.event.is_set()
+    assert isinstance(state.error, RequestCancelledError)
+    assert state.result is None
+    assert requests_sent == [True]
+    assert closed
+    assert operation.transfer_params_cache == {}
+
+
+def test_resume_discards_completed_prefetch_from_previous_cookie():
+    operation = make_operation("https://pan.baidu.com/s/no-password")
+    state = PrefetchState(event=threading.Event(), cookie_generation=operation.cookie_generation)
+    state.result = VALID_RESULT
+    state.event.set()
+    operation.prefetch_states[("https://pan.baidu.com/s/no-password", "")] = state
+    operation.root.entry_cookie.value = "BAIDUID=refreshed"
+    verified = []
+    operation.verify_link = lambda *_args: verified.append(True) or VALID_RESULT
+
+    operation.prepare_run(resume=True)
+    operation.get_cached_transfer_params(operation.link_list[0])
+
+    assert state.cancel_event.is_set()
+    assert operation.prefetch_states == {}
+    assert verified == [True]
+
+
+def test_invalid_prefetched_share_result_is_not_cached():
+    operation = make_operation("https://pan.baidu.com/s/no-password")
+    state = PrefetchState(event=threading.Event(), cookie_generation=operation.cookie_generation)
+    state.result = -6
+    state.event.set()
+    operation.prefetch_states[("https://pan.baidu.com/s/no-password", "")] = state
+
+    assert operation.get_cached_transfer_params(operation.link_list[0]) == -6
+    assert operation.transfer_params_cache == {}
+    assert operation.get_cached_transfer_params(operation.link_list[0]) == VALID_RESULT
 
 
 def test_resuming_unknown_transfer_reuses_the_same_directory():
@@ -799,6 +1122,52 @@ def test_retry_exhaustion_preserves_the_checkpoint_until_resumed(monkeypatch):
 
     assert paths == ["/target/1"] * 6 + ["/target/2"]
     assert operation.completed_task_count == 2
+
+
+def test_explicit_temporary_failure_does_not_hide_a_later_permanent_failure():
+    from src.network import RetryExhaustedError
+
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    results = iter([RetryExhaustedError(500), -10])
+
+    def transfer(*_args, **_kwargs):
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    operation.network.transfer_file = transfer
+    operation.handle_process_save()
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+    assert operation.unknown_transfer_tasks == set()
+
+    operation.change_status('running')
+    operation.handle_process_save()
+    assert operation.next_task_index == 1
+    assert "容量不足" in operation.root.text_logs.value
+
+
+def test_temporary_failure_on_resume_cannot_discard_a_previous_unknown_write():
+    from src.network import RetryExhaustedError
+
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    results = iter([UNKNOWN_RESULT, RetryExhaustedError(500), -10])
+
+    def transfer(*_args, **_kwargs):
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    operation.network.transfer_file = transfer
+    for _attempt in range(3):
+        operation.change_status('running')
+        operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+    assert operation.unknown_transfer_tasks == {0}
+    assert operation.pending_custom_dirs == {0: "target/1"}
 
 
 @pytest.mark.parametrize("stage", ["verify", "create", "list"])
