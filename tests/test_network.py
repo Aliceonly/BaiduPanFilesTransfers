@@ -1,7 +1,7 @@
 import pytest
 import requests
 
-from src.network import Network
+from src.network import Network, UNKNOWN_RESULT
 from src.utils import parse_response, parse_url_and_code
 
 
@@ -24,6 +24,14 @@ class FakeSession:
         self.requests = []
 
     def post(self, **kwargs):
+        self.calls += 1
+        self.requests.append(kwargs)
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def get(self, **kwargs):
         self.calls += 1
         self.requests.append(kwargs)
         response = next(self.responses)
@@ -85,6 +93,23 @@ def test_transfer_timeout_retries_without_changing_destination(monkeypatch):
     assert result == 0
     assert network.s.calls == 2
     assert all(request["data"]["path"] == "/target/1" for request in network.s.requests)
+
+
+def test_transfer_timeout_then_collision_keeps_result_unknown(monkeypatch):
+    network = Network()
+    network.s = FakeSession([requests.Timeout("timeout"), FakeResponse(4)])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    retries = []
+
+    result = network.transfer_file(
+        ["123", "456", ["789"], ["file"], ["0"]],
+        "target/1",
+        on_retry=lambda attempt, reason: retries.append((attempt, reason)),
+    )
+
+    assert result == UNKNOWN_RESULT
+    assert network.s.calls == 2
+    assert retries == [(2, "Timeout")]
 
 
 def test_exhausted_timeouts_raise_for_item_level_handling(monkeypatch):
@@ -152,6 +177,37 @@ def test_create_directory_rejects_an_unexpected_destination():
 
     with pytest.raises(ValueError, match="1_renamed"):
         Network.create_dir.__wrapped__(network, "target/1")
+
+
+def test_get_bdstoken_retries_invalid_response_five_times(monkeypatch):
+    network = Network()
+    network.s = FakeSession([FakeResponse(None)] * 4 + [
+        FakeResponse(0, {"errno": 0, "result": {"bdstoken": "token"}})
+    ])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    retries = []
+
+    assert network.get_bdstoken(
+        on_retry=lambda attempt, reason: retries.append((attempt, reason))
+    ) == "token"
+    assert network.s.calls == 5
+    assert [attempt for attempt, _reason in retries] == [2, 3, 4, 5]
+
+
+def test_get_dir_list_reads_all_pages():
+    first_page = [{"fs_id": str(index)} for index in range(1000)]
+    second_page = [{"fs_id": "1000"}]
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, {"errno": 0, "list": first_page, "total": 1001}),
+        FakeResponse(0, {"errno": 0, "list": second_page, "total": 1001}),
+    ])
+
+    result = network.get_dir_list("/target")
+
+    assert len(result) == 1001
+    assert network.s.requests[0]["params"]["page"] == "1"
+    assert network.s.requests[1]["params"]["page"] == "2"
 
 
 def test_network_instances_do_not_share_cookie_headers():

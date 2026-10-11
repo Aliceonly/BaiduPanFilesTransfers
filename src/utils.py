@@ -27,16 +27,20 @@ SERVER_FILENAME_REGEX = re.compile(r'"server_filename"\s*:\s*("(?:[^"\\]|\\.)*")
 ISDIR_REGEX = re.compile(r'"isdir"\s*:\s*([01])\s*[,}]')
 
 
-def thread_it(func: Callable, *args: Tuple[Any, ...]) -> None:
+def thread_it(func: Callable, *args: Tuple[Any, ...]) -> threading.Thread:
     """
     多线程防止转存时主界面卡死。
 
     :param func: 要调用的函数
     :param args: 函数参数
-    :return: 无返回值
+    :return: 新建的 worker thread
     """
-    t = threading.Thread(target=func, args=args)
+    # The window close handler can request cancellation and wait for this
+    # thread. Daemon mode is the final safeguard if a third-party request
+    # library does not return promptly.
+    t = threading.Thread(target=func, args=args, daemon=True)
     t.start()
+    return t
 
 
 def write_config(config: str) -> None:
@@ -107,10 +111,32 @@ def parse_url_and_code(url_code: str) -> Tuple[str, str]:
     :param url_code: 输入的标准链接格式
     :return: 链接和提取码
     """
-    url, _, code = url_code.partition(' ')
-    url, code = url.strip(), code.strip()
-    # 暴力切片，如果输入链接不是以提取码结尾，会得到错误提取码
-    return url[:47], code[-4:]
+    if not isinstance(url_code, str):
+        return '', ''
+
+    # The URL can be preceded by a title. Keep the first URL and parse its
+    # query before looking at free-form text after it.
+    url_match = re.search(r'https?://\S+', url_code)
+    if not url_match:
+        return '', ''
+
+    url_token = url_match.group(0).rstrip('.,，。;；)]）')
+    url_end = url_match.start() + len(url_token)
+    query_code = re.search(r'(?:[?&]|%3F|%26)pwd=([A-Za-z0-9]{4})\b', url_token, re.IGNORECASE)
+    if query_code:
+        code = query_code.group(1)
+    else:
+        # Use the first exact four-character token. This avoids treating an
+        # archive password or other trailing note as the Baidu passcode.
+        code_match = re.search(
+            r'(?<![A-Za-z0-9])([A-Za-z0-9]{4})(?![A-Za-z0-9])',
+            url_code[url_end:],
+        )
+        code = code_match.group(1) if code_match else ''
+
+    # Keep the historical URL length guard for malformed overlong input.
+    url = url_token.split('?', 1)[0][:47]
+    return url, code
 
 
 def parse_response(response: str) -> Union[List[Any], int]:

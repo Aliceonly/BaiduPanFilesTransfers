@@ -7,6 +7,7 @@
 """
 
 import re
+import time
 from tkinter import PhotoImage
 import webbrowser
 from typing import Callable
@@ -15,7 +16,7 @@ import ttkbootstrap as ttk
 from ttkbootstrap.dialogs import Messagebox
 
 from src.constants import COLOR_THEME, LABEL_MAP, EXP_MAP, MW_PADDING, MAIN_TITLE, MAIN_VERSION, HOME_PAGE, TOOLTIP_PADDING, TOOLTIP_DELAY, COLOR_MAP
-from src.utils import thread_it, read_config, create_icon
+from src.utils import read_config, create_icon
 
 
 class MainWindow(ttk.Window):
@@ -29,10 +30,13 @@ class MainWindow(ttk.Window):
         """初始化 UI 元素"""
         super().__init__()
         self.op = op
+        self._closing = False
+        self._close_deadline = 0.0
         self.icon_path = create_icon()
         self._setup_window()
         self._create_widgets()
         self._init_config()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _setup_window(self) -> None:
         """主窗口配置"""
@@ -86,7 +90,7 @@ class MainWindow(ttk.Window):
 
     def _create_button(self, text: str, command: Callable, column: int) -> ttk.Button:
         """建立功能按钮"""
-        button = ttk.Button(self.frame_bottom, text=text, width=10, padding="17 17 17 17", command=lambda: thread_it(command))
+        button = ttk.Button(self.frame_bottom, text=text, width=10, padding="17 17 17 17", command=command)
         button.grid(row=0, column=column, padx=MW_PADDING)
         return button
 
@@ -99,11 +103,29 @@ class MainWindow(ttk.Window):
 
     def _save_button_click(self) -> None:
         """当按钮被点击时，调用逻辑处理对象的批量转存方法"""
-        self.op.save()
+        self.op.start_save()
 
     def _share_button_click(self) -> None:
         """当按钮被点击时，调用逻辑处理对象的批量分享方法"""
-        self.op.share()
+        self.op.start_share()
+
+    def _on_close(self) -> None:
+        """请求 worker 退出后再销毁 Tk root。"""
+        if self._closing:
+            return
+        self._closing = True
+        self._close_deadline = time.monotonic() + 2.0
+        if self.op is None:
+            self.destroy()
+            return
+        self.op.request_cancel()
+        self._wait_worker_before_destroy()
+
+    def _wait_worker_before_destroy(self) -> None:
+        if self.op.is_worker_alive() and time.monotonic() < self._close_deadline:
+            self.after(50, self._wait_worker_before_destroy)
+        else:
+            self.destroy()
 
     def run(self) -> None:
         """运行程序"""
@@ -156,6 +178,8 @@ class TextEditor:
 
     def _manage_placeholder(self, text: ttk.Text, placeholder: str) -> None:
         """管理文本框提示文字占位符"""
+        text.placeholder_text = placeholder
+        text.is_placeholder = bool(placeholder)
         if placeholder:
             text.insert("1.0", placeholder)
             text.config(fg=COLOR_MAP['placeholder'])
@@ -168,6 +192,7 @@ class TextEditor:
         if text.get("1.0", "end-1c") == placeholder:
             text.delete("1.0", "end")
             text.config(fg=COLOR_MAP['text'])
+            text.is_placeholder = False
 
     @staticmethod
     def _on_focus_out(text: ttk.Text, placeholder: str) -> None:
@@ -175,6 +200,7 @@ class TextEditor:
         if not text.get("1.0", "end-1c"):
             text.insert("1.0", placeholder)
             text.config(fg=COLOR_MAP['placeholder'])
+            text.is_placeholder = True
 
 
 class CustomDialog(ttk.Toplevel):

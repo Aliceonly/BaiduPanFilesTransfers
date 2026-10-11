@@ -51,16 +51,17 @@ def test_normalize_link(url_code, expected):
     ("https://pan.baidu.com/s/1o8_qk1W4c7y8sXyJ4ZnWfQ A1B2 ", ("https://pan.baidu.com/s/1o8_qk1W4c7y8sXyJ4ZnWfQ", "A1B2")),
     # 空白提取码
     ("https://pan.baidu.com/s/1o8_qk1W4c7y8sXyJ4ZnWfQ ", ("https://pan.baidu.com/s/1o8_qk1W4c7y8sXyJ4ZnWfQ", "")),
-    # 链接带多个空格，取到错误提取码
-    ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA abcd 解压密码为：5201314 ", ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA", "1314")),
+    # URL query 中的 pwd 优先于链接后的说明
+    ("https://pan.baidu.com/s/1o8_qk1W4c7y8sXyJ4ZnWfQ?pwd=abcd 解压密码：9999 ", ("https://pan.baidu.com/s/1o8_qk1W4c7y8sXyJ4ZnWfQ", "abcd")),
+    # 忽略链接后面的解压密码说明，使用第一个四位提取码
+    ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA abcd 解压密码为：5201314 ", ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA", "abcd")),
     # 链接错误，长度过长
     ("https://pan.baidu.com/s/1o8_qk1W4c7y8sXyJ4ZnWfQA1B2 A1B2 ", ("https://pan.baidu.com/s/1o8_qk1W4c7y8sXyJ4ZnWfQ", "A1B2")),
     # 链接错误，长度过短
     ("https://pan.baidu.com/s/1o8_qk1W4c7y8s A1B2 ", ("https://pan.baidu.com/s/1o8_qk1W4c7y8s", "A1B2")),
-    # 提取码错误，超过4位
-    ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA 12345 ", ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA", "2345")),
-    # 提取码错误，不足4位
-    ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA 123 ", ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA", "123")),
+    # 非四位提取码不应被尾部切片伪造成合法 code
+    ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA 12345 ", ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA", "")),
+    ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA 123 ", ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA", "")),
 ])
 def test_parse_url_and_code(url_code, expected):
     """测试把链接分割为 URL 和提取码"""

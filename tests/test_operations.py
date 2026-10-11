@@ -1,9 +1,11 @@
 from types import SimpleNamespace
+import threading
 import json
 
 import pytest
 
-from src.operations import Operations
+from src.network import UNKNOWN_RESULT
+from src.operations import CancellationRequested, Operations
 
 
 VALID_RESULT = ["123", "456", ["789"], ["file"], ["0"]]
@@ -82,6 +84,125 @@ def test_setup_save_keeps_duplicate_input_rows_aligned():
 
     assert len(operation.link_list) == 2
     assert len(operation.link_list_org) == 2
+
+
+def test_placeholder_text_is_not_treated_as_a_real_link():
+    operation = Operations(make_root(""))
+    operation.root.text_links.value = "百度网盘分享链接示例：\nhttps://pan.baidu.com/s/1example"
+    operation.root.text_links.placeholder_text = operation.root.text_links.value
+    operation.root.text_links.is_placeholder = True
+
+    operation.prepare_run()
+    operation.setup_save()
+
+    assert operation.link_list == []
+    assert operation.valid_link_count == 0
+
+
+def test_unknown_transfer_result_keeps_current_directory_and_checkpoint():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    paths = []
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or UNKNOWN_RESULT
+    )
+
+    operation.handle_process_save()
+
+    assert paths == ["target/1"]
+    assert operation.next_task_index == 0
+    assert operation.completed_task_count == 0
+    assert operation.resume_available is True
+    assert "结果未知" in operation.root.text_logs.value
+
+
+def test_resuming_unknown_transfer_reuses_the_same_directory():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    paths = []
+    results = iter([UNKNOWN_RESULT, 0])
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or next(results)
+    )
+
+    operation.handle_process_save()
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert paths == ["target/1", "target/1"]
+    assert operation.next_task_index == 1
+    assert operation.custom_dir_count == 1
+
+
+def test_share_item_exception_does_not_stop_following_items():
+    operation = make_operation("")
+    operation.dir_list_all = [
+        {"isdir": 0, "server_filename": "first", "fs_id": 1},
+        {"isdir": 0, "server_filename": "second", "fs_id": 2},
+    ]
+    operation.expiry = "永久"
+    operation.password = "1234"
+    operation.random_password = False
+    calls = []
+
+    def create_share(fs_id, *_args):
+        calls.append(fs_id)
+        if fs_id == 1:
+            raise ValueError("malformed share item")
+        return "https://pan.baidu.com/s/1shared"
+
+    operation.network.create_share = create_share
+    operation.handle_process_share()
+
+    assert calls == [1, 2]
+    assert operation.completed_task_count == 2
+    assert "malformed share item" in operation.root.text_logs.value
+    assert "分享成功" in operation.root.text_logs.value
+
+
+def test_resume_keeps_runtime_bdclnd_when_cookie_input_is_unchanged():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.prepare_run()
+    operation.network.headers["Cookie"] = "BAIDUID=test;BDCLND=runtime"
+    operation.batch_cookie = "BAIDUID=test"
+    operation.resume_available = True
+
+    operation.prepare_run(resume=True)
+
+    assert operation.network.headers["Cookie"] == "BAIDUID=test;BDCLND=runtime"
+
+
+def test_base_directory_internal_spaces_are_preserved():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.root.entry_folder_name.value = "base folder"
+    operation.prepare_run()
+    operation.setup_save()
+    paths = []
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or 0
+    )
+
+    operation.handle_process_save()
+
+    assert paths == ["base folder/1"]
+
+
+def test_cancelled_paused_worker_exits_promptly():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.running = False
+    finished = threading.Event()
+
+    def worker():
+        try:
+            operation.pause_detection("https://pan.baidu.com/s/1first")
+        except CancellationRequested:
+            finished.set()
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    operation.request_cancel()
+    thread.join(timeout=1)
+
+    assert finished.is_set()
+    assert not thread.is_alive()
 
 
 def test_custom_directory_number_counts_only_valid_links():
