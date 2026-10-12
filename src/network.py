@@ -39,6 +39,15 @@ class RetryExhaustedError(requests.RequestException):
         super().__init__(f'临时 API 错误（{errno}），{REQUEST_ATTEMPTS} 次尝试已耗尽')
 
 
+class ParsedTransferPage(str):
+    """String-compatible share HTML carrying its validated parameters."""
+
+    def __new__(cls, value: str, parsed: Union[List[Any], int]):
+        page = str.__new__(cls, value)
+        page.parsed = parsed
+        return page
+
+
 class Network:
     """
     网络请求相关类。
@@ -86,6 +95,7 @@ class Network:
         on_retry: RetryCallback = None,
         unknown_on_exhaustion: bool = False,
         validator: Optional[Callable[[dict], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Union[dict, int, str]:
         """
         发送 JSON API 请求并统一处理 retry。
@@ -94,40 +104,52 @@ class Network:
         发出但 response 不可确认时，调用方不能把它当成普通失败继续换目录。
         """
         result_unknown = False
-        for attempt in range(1, REQUEST_ATTEMPTS + 1):
-            try:
-                response = request()
-                raise_for_status = getattr(response, 'raise_for_status', None)
-                if raise_for_status:
-                    raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict) or type(payload.get('errno')) is not int:
-                    raise ValueError('API response 缺少有效的 errno')
-                if payload['errno'] == 0 and validator:
-                    validator(payload)
-            except (requests.RequestException, ValueError, TypeError, KeyError,
-                    AttributeError, UnicodeError) as error:
-                result_unknown = unknown_on_exhaustion
+        try:
+            for attempt in range(1, REQUEST_ATTEMPTS + 1):
+                self._check_cancelled(cancel_event)
+                try:
+                    response = request()
+                    raise_for_status = getattr(response, 'raise_for_status', None)
+                    if raise_for_status:
+                        raise_for_status()
+                    payload = response.json()
+                    if not isinstance(payload, dict) or type(payload.get('errno')) is not int:
+                        raise ValueError('API response 缺少有效的 errno')
+                    if payload['errno'] == 0 and validator:
+                        validator(payload)
+                except (requests.RequestException, ValueError, TypeError, KeyError,
+                        AttributeError, UnicodeError) as error:
+                    result_unknown = unknown_on_exhaustion
+                    self._check_cancelled(cancel_event)
+                    if attempt == REQUEST_ATTEMPTS:
+                        if unknown_on_exhaustion:
+                            return UNKNOWN_RESULT
+                        raise
+                    self._notify_retry(on_retry, attempt, type(error).__name__)
+                    self._wait_before_retry(cancel_event)
+                    continue
+
+                errno = payload['errno']
+                if not unknown_on_exhaustion:
+                    self._check_cancelled(cancel_event)
+                # A definite write response still counts even if cancellation
+                # arrived in flight; do not replay a confirmed success on resume.
+                if errno == 0:
+                    return payload
+                if errno in NON_RETRYABLE_CODES:
+                    return UNKNOWN_RESULT if result_unknown else payload
+                self._check_cancelled(cancel_event)
                 if attempt == REQUEST_ATTEMPTS:
-                    if unknown_on_exhaustion:
+                    if result_unknown:
                         return UNKNOWN_RESULT
-                    raise
-                self._notify_retry(on_retry, attempt, type(error).__name__)
-                self._sleep_before_retry()
-                continue
+                    raise RetryExhaustedError(errno)
 
-            errno = payload['errno']
-            if errno == 0:
-                return payload
-            if errno in NON_RETRYABLE_CODES:
-                return UNKNOWN_RESULT if result_unknown else payload
-            if attempt == REQUEST_ATTEMPTS:
-                if result_unknown:
-                    return UNKNOWN_RESULT
-                raise RetryExhaustedError(errno)
-
-            self._notify_retry(on_retry, attempt, errno)
-            self._sleep_before_retry()
+                self._notify_retry(on_retry, attempt, errno)
+                self._wait_before_retry(cancel_event)
+        except RequestCancelledError:
+            if result_unknown:
+                return UNKNOWN_RESULT
+            raise
 
         raise RuntimeError('API retry loop unexpectedly ended')
 
@@ -167,7 +189,11 @@ class Network:
 
         raise RuntimeError('API retry loop unexpectedly ended')
 
-    def get_bdstoken(self, on_retry: RetryCallback = None) -> Union[str, int]:
+    def get_bdstoken(
+        self,
+        on_retry: RetryCallback = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Union[str, int]:
         """获取 bdstoken。"""
         url = f'{BASE_URL}/api/gettemplatevariable'
         params = {
@@ -193,6 +219,7 @@ class Network:
             ),
             on_retry=on_retry,
             validator=validate,
+            cancel_event=cancel_event,
         )
         if payload == UNKNOWN_RESULT:
             return -1
@@ -206,6 +233,7 @@ class Network:
         self,
         folder_name: str,
         on_retry: RetryCallback = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Union[List[Any], int]:
         """获取目录的完整列表，自动请求所有 pagination pages。"""
         url = f'{BASE_URL}/api/list'
@@ -267,6 +295,7 @@ class Network:
                 ),
                 on_retry=on_retry,
                 validator=validate,
+                cancel_event=cancel_event,
             )
             if payload == UNKNOWN_RESULT:
                 return -1
@@ -289,7 +318,12 @@ class Network:
                 continue
             return all_items
 
-    def create_dir(self, folder_name: str, on_retry: RetryCallback = None) -> Union[int, str]:
+    def create_dir(
+        self,
+        folder_name: str,
+        on_retry: RetryCallback = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Union[int, str]:
         """新建指定目录。"""
         url = f'{BASE_URL}/api/create'
         params = {
@@ -316,6 +350,7 @@ class Network:
             on_retry=on_retry,
             unknown_on_exhaustion=True,
             validator=validate,
+            cancel_event=cancel_event,
         )
         if payload == UNKNOWN_RESULT:
             return UNKNOWN_RESULT
@@ -328,6 +363,7 @@ class Network:
         link_url: str,
         pass_code: str,
         on_retry: RetryCallback = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Union[str, int]:
         """验证提取码并返回 bdclnd。"""
         url = f'{BASE_URL}/share/verify'
@@ -352,6 +388,7 @@ class Network:
             ),
             on_retry=on_retry,
             validator=validate,
+            cancel_event=cancel_event,
         )
         if payload == UNKNOWN_RESULT:
             return -1
@@ -368,22 +405,28 @@ class Network:
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
         """请求分享页面，获取转存所需的原始 response。"""
+        parsed = -1
+
         def validate(text):
-            if not is_valid_transfer_params(parse_response(text)) and not is_permanent_share_error(text):
+            nonlocal parsed
+            parsed = parse_response(text)
+            if not is_valid_transfer_params(parsed) and not is_permanent_share_error(text):
                 raise ValueError('分享页面缺少有效的转存参数')
 
-        return self._request_text(
+        text = self._request_text(
             lambda: self.s.get(url=url, headers=self.headers, timeout=15, verify=False),
             on_retry=on_retry,
             validator=validate,
             cancel_event=cancel_event,
         )
+        return ParsedTransferPage(text, parsed)
 
     def transfer_file(
         self,
         params_list: List[Any],
         folder_name: str,
         on_retry: RetryCallback = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Union[int, str]:
         """
         转存百度网盘文件。
@@ -414,6 +457,7 @@ class Network:
             ),
             on_retry=on_retry,
             unknown_on_exhaustion=True,
+            cancel_event=cancel_event,
         )
         if payload == UNKNOWN_RESULT:
             return UNKNOWN_RESULT
@@ -427,6 +471,7 @@ class Network:
         expiry: str,
         password: str,
         on_retry: RetryCallback = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Union[str, int]:
         """生成百度网盘分享链接。"""
         url = f'{BASE_URL}/share/set'
@@ -458,6 +503,7 @@ class Network:
             on_retry=on_retry,
             unknown_on_exhaustion=True,
             validator=validate,
+            cancel_event=cancel_event,
         )
         if payload == UNKNOWN_RESULT:
             return UNKNOWN_RESULT

@@ -4,7 +4,7 @@ import threading
 import pytest
 import requests
 
-from src.network import Network, RequestCancelledError, UNKNOWN_RESULT
+from src.network import Network, ParsedTransferPage, RequestCancelledError, UNKNOWN_RESULT
 from src.utils import parse_response, parse_url_and_code
 
 
@@ -593,3 +593,134 @@ def test_invalid_page_is_a_link_error(response):
 
 def test_link_without_a_password_separator_can_be_parsed():
     assert parse_url_and_code("https://pan.baidu.com/s/1link") == ("https://pan.baidu.com/s/1link", "")
+
+
+JSON_REQUEST_ARGUMENTS = {
+    "get_bdstoken": (),
+    "get_dir_list": ("/target",),
+    "verify_pass_code": ("https://pan.baidu.com/s/1first", "1234"),
+    "create_dir": ("target/1",),
+    "transfer_file": (["123", "456", ["789"], ["file"], ["0"]], "target/1"),
+    "create_share": (789, 0, "1234"),
+}
+
+
+@pytest.mark.parametrize("method", JSON_REQUEST_ARGUMENTS)
+def test_cancelled_json_call_never_sends_a_request(method):
+    network = Network()
+    network.s = FakeSession([])
+    cancelled = threading.Event()
+    cancelled.set()
+
+    with pytest.raises(RequestCancelledError):
+        getattr(network, method)(*JSON_REQUEST_ARGUMENTS[method], cancel_event=cancelled)
+
+    assert network.s.calls == 0
+
+
+@pytest.mark.parametrize("method", JSON_REQUEST_ARGUMENTS)
+def test_main_json_retry_wait_is_interruptible(method):
+    network = Network()
+    network.s = FakeSession([FakeResponse(500)])
+    cancelled = threading.Event()
+
+    with pytest.raises(RequestCancelledError):
+        getattr(network, method)(
+            *JSON_REQUEST_ARGUMENTS[method], cancel_event=cancelled,
+            on_retry=lambda *_args: cancelled.set(),
+        )
+
+    assert network.s.calls == 1
+
+
+@pytest.mark.parametrize("method", ["create_dir", "transfer_file", "create_share"])
+def test_cancellation_during_ambiguous_write_retry_preserves_unknown_result(method):
+    network = Network()
+    network.s = FakeSession([requests.Timeout("ambiguous write")])
+    cancelled = threading.Event()
+
+    result = getattr(network, method)(
+        *JSON_REQUEST_ARGUMENTS[method], cancel_event=cancelled,
+        on_retry=lambda *_args: cancelled.set(),
+    )
+
+    assert result == UNKNOWN_RESULT
+    assert network.s.calls == 1
+
+
+def test_cancelled_pagination_does_not_request_the_next_page():
+    network = Network()
+    cancelled = threading.Event()
+
+    def first_page(**_kwargs):
+        cancelled.set()
+        return FakeResponse(0, {"errno": 0, "list": [{"fs_id": 1}], "has_more": 1})
+
+    from unittest.mock import Mock
+    network.s = Mock(get=Mock(side_effect=first_page))
+
+    with pytest.raises(RequestCancelledError):
+        network.get_dir_list("/target", cancel_event=cancelled)
+
+    assert network.s.get.call_count == 1
+
+
+@pytest.mark.parametrize("method", ["get_bdstoken", "transfer_file"])
+def test_main_json_worker_wakes_when_cancelled_during_retry_wait(monkeypatch, method):
+    network = Network()
+    ambiguous = method == "transfer_file"
+    network.s = FakeSession([requests.Timeout("in flight") if ambiguous else FakeResponse(500)])
+    waiting = threading.Event()
+    results = []
+    errors = []
+
+    class CancellationEvent(threading.Event):
+        def wait(self, timeout=None):
+            waiting.set()
+            return super().wait(timeout)
+
+    cancelled = CancellationEvent()
+    monkeypatch.setattr("src.network.random.uniform", lambda *_args: 60)
+
+    def request():
+        try:
+            results.append(getattr(network, method)(
+                *JSON_REQUEST_ARGUMENTS[method], cancel_event=cancelled,
+            ))
+        except RequestCancelledError as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=request, daemon=True)
+    thread.start()
+    try:
+        assert waiting.wait(2)
+    finally:
+        cancelled.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert network.s.calls == 1
+    assert results == ([UNKNOWN_RESULT] if ambiguous else [])
+    assert len(errors) == (0 if ambiguous else 1)
+
+
+def test_share_page_wrapper_contains_only_the_final_validated_response(monkeypatch):
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, content=b"<p>Busy</p>"), FakeResponse(0, content=SHARE_PAGE),
+    ])
+    monkeypatch.setattr("src.network.time.sleep", lambda *_args: None)
+    parsed = []
+
+    def parse(text):
+        parsed.append(text)
+        return parse_response(text)
+
+    monkeypatch.setattr("src.network.parse_response", parse)
+    result = network.get_transfer_params("https://pan.baidu.com/s/1first")
+
+    assert isinstance(result, str)
+    assert isinstance(result, ParsedTransferPage)
+    assert result == SHARE_PAGE.decode()
+    assert result.parsed == ["123", "456", ["789"], ["file"], ["0"]]
+    assert parsed == ["<p>Busy</p>", SHARE_PAGE.decode()]

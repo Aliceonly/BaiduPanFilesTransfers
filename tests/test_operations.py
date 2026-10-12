@@ -1107,7 +1107,7 @@ def test_retry_exhaustion_preserves_the_checkpoint_until_resumed(monkeypatch):
         return SimpleNamespace(json=lambda: {"errno": errno}, raise_for_status=lambda: None)
 
     operation.network.s = SimpleNamespace(post=post)
-    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("src.network.random.uniform", lambda *_args: 0)
 
     operation.handle_process_save()
 
@@ -1180,7 +1180,7 @@ def test_temporary_api_exhaustion_retains_current_item_at_every_stage(monkeypatc
         return SimpleNamespace(json=lambda: {"errno": 500}, raise_for_status=lambda: None)
 
     operation.network.s = SimpleNamespace(post=response, get=response)
-    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("src.network.random.uniform", lambda *_args: 0)
     if stage == "verify":
         del operation.verify_link
     elif stage == "create":
@@ -1219,7 +1219,7 @@ def test_invalid_share_html_exhaustion_retains_the_batch_checkpoint(monkeypatch)
         return SimpleNamespace(content=body, raise_for_status=lambda: None)
 
     operation.network.s = SimpleNamespace(get=get)
-    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("src.network.random.uniform", lambda *_args: 0)
 
     operation.handle_process_save()
 
@@ -1238,7 +1238,7 @@ def test_incomplete_directory_listing_does_not_start_a_partial_share_batch(monke
     del operation.network.get_dir_list
     calls = []
     responses = iter([{"errno": 0, "list": [], "has_more": 1}] * 5)
-    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("src.network.random.uniform", lambda *_args: 0)
     operation.network.s = SimpleNamespace(
         get=lambda **_kwargs: SimpleNamespace(
             json=lambda: next(responses),
@@ -1328,7 +1328,7 @@ def test_save_runs_all_network_stages_with_titles_duplicates_and_retry(monkeypat
     operation.network.s = SimpleNamespace(
         get=get, post=post, close=lambda: closed.append(True),
     )
-    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("src.network.random.uniform", lambda *_args: 0)
 
     operation.save()
 
@@ -1702,3 +1702,153 @@ def test_large_batch_stays_aligned_after_duplicate_titles_and_links():
 
     assert paths == [f"target/{number}" for number in range(1, 501)]
     assert operation.completed_task_count == 1000
+
+
+@pytest.mark.parametrize("custom_mode", [False, True])
+def test_resume_reconciles_unknown_transfer_before_verifying_expired_source(custom_mode):
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.root.var_custom_mode.value = custom_mode
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    transfers = []
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: transfers.append(path) or UNKNOWN_RESULT
+    )
+    operation.save()
+    assert operation.next_task_index == 0
+
+    operation.verify_link = lambda *_args: pytest.fail("the source is no longer needed")
+    listed = []
+    target = {"fs_id": 900, "server_filename": "file", "isdir": 0,
+              "size": 100, "md5": FILE_MD5}
+    operation.network.get_dir_list = lambda path, **_kwargs: listed.append(path) or [target]
+    operation.save(resume=True)
+
+    expected_path = "target/1" if custom_mode else "target"
+    assert transfers == [expected_path]
+    assert listed == [f"/{expected_path}"]
+    assert operation.next_task_index == 1
+    assert operation.pending_custom_dirs == {}
+    assert operation.unknown_transfer_tasks == set()
+    assert operation.resume_available is False
+    assert "转存成功" in operation.root.text_logs.value
+    assert operation.saved_links == (set() if custom_mode else {operation.link_list[0]})
+
+
+def test_expired_source_keeps_unknown_checkpoint_when_target_evidence_is_incomplete():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+    operation.save()
+    operation.verify_link = lambda *_args: -9
+    listed = []
+    operation.network.get_dir_list = lambda path: listed.append(path) or [
+        {"fs_id": 900, "server_filename": "file", "isdir": 0, "size": 100},
+    ]
+
+    operation.save(resume=True)
+
+    assert listed == ["/target/1"]
+    assert operation.next_task_index == 0
+    assert operation.pending_custom_dirs == {0: "target/1"}
+    assert operation.unknown_transfer_tasks == {0}
+    assert operation.resume_available is True
+
+
+@pytest.mark.parametrize("label", ["链接:", "链接：", "链接 :", "链接 ："])
+def test_copied_link_labels_do_not_become_custom_directory_names(label):
+    operation = make_operation(
+        f"{label} https://pan.baidu.com/s/1first 1234\n"
+        f"{label} https://pan.baidu.com/s/1second 1234\n"
+        "named https://pan.baidu.com/s/1third 1234"
+    )
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+
+    operation.handle_process_save()
+
+    assert paths == ["target/1", "target/2", "target/named"]
+
+
+@pytest.mark.parametrize("outcome", ["success", "temporary", "timeout"])
+def test_cancelling_main_transfer_stops_retries_and_preserves_checkpoint(monkeypatch, outcome):
+    operation = make_save_operation(
+        "https://pan.baidu.com/s/1first 1234\nhttps://pan.baidu.com/s/1second 1234"
+    )
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    del operation.network.transfer_file
+    calls = []
+
+    def post(**kwargs):
+        calls.append(kwargs["data"]["path"])
+        operation.request_cancel()
+        if outcome == "timeout":
+            raise requests.Timeout("ambiguous cancelled write")
+        return SimpleNamespace(json=lambda: {"errno": 0 if outcome == "success" else 500})
+
+    monkeypatch.setattr(operation.network.s, "post", post)
+    monkeypatch.setattr("src.network.time.sleep", lambda *_args: None)
+    operation.save()
+
+    assert calls == ["/target/1"]
+    assert operation.next_task_index == (1 if outcome == "success" else 0)
+    assert operation.resume_available is True
+    if outcome == "timeout":
+        assert operation.unknown_transfer_tasks == {0}
+        assert operation.unknown_transfer_states[0].folder_name == "target/1"
+        assert operation.pending_custom_dirs == {0: "target/1"}
+    else:
+        assert operation.unknown_transfer_tasks == set()
+
+
+def test_main_share_page_retry_receives_the_cancellation_event(monkeypatch):
+    operation = make_operation("https://pan.baidu.com/s/1first")
+    del operation.verify_link
+    calls = []
+
+    def get(**_kwargs):
+        calls.append(True)
+        operation.request_cancel()
+        raise requests.Timeout("cancelled read")
+
+    monkeypatch.setattr(operation.network.s, "get", get)
+    monkeypatch.setattr("src.network.time.sleep", lambda *_args: None)
+
+    with pytest.raises(CancellationRequested):
+        operation.verify_link("https://pan.baidu.com/s/1first", "")
+
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_validated_share_page_is_not_parsed_again_by_operations(monkeypatch, prefetch):
+    operation = make_operation("https://pan.baidu.com/s/1first")
+    del operation.verify_link
+    parsed = []
+    page = json.dumps({"shareid": 123, "share_uk": 456, "file_list": [
+        {"fs_id": 789, "server_filename": "file", "isdir": 0, "size": 100, "md5": FILE_MD5},
+    ]})
+    from src.utils import parse_response
+
+    def parse_once(text):
+        parsed.append(True)
+        return parse_response(text)
+
+    monkeypatch.setattr("src.network.parse_response", parse_once)
+    monkeypatch.setattr(
+        "src.operations.parse_response",
+        lambda *_args: pytest.fail("validated parameters should be reused"),
+    )
+    monkeypatch.setattr(
+        "requests.Session.get",
+        lambda *_args, **_kwargs: SimpleNamespace(content=page.encode()),
+    )
+    if prefetch:
+        operation.network.bdstoken = "token"
+        monkeypatch.setattr("src.operations.thread_it", lambda func, *args: func(*args))
+        operation.schedule_prefetch(0)
+
+    result = operation.get_cached_transfer_params(operation.link_list[0])
+
+    assert result == VERIFIABLE_RESULT
+    assert result.item_metadata == [{"size": 100, "md5": FILE_MD5}]
+    assert parsed == [True]

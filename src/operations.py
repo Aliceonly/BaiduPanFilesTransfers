@@ -20,7 +20,9 @@ from typing import Union, List, Dict, Any, Tuple, Optional
 import requests
 
 from src.constants import EXP_MAP, DELAY_SECONDS, INVALID_CHARS, ERROR_CODES, SAVE_LIMIT, COLOR_MAP
-from src.network import Network, RequestCancelledError, RetryExhaustedError, UNKNOWN_RESULT
+from src.network import (
+    Network, ParsedTransferPage, RequestCancelledError, RetryExhaustedError, UNKNOWN_RESULT,
+)
 from src.ui import CustomDialog
 from src.utils import (
     thread_it,
@@ -187,16 +189,27 @@ class Operations:
     def _retry_log(self, attempt: int, reason: Any) -> None:
         self.insert_logs(f'请求失败（{reason}），正在第 {attempt} 次尝试')
 
-    def _network_call(self, method, *args):
-        """兼容旧测试或外部替换的无 callback mock。"""
+    def _call_network_method(self, method, *args, on_retry=None):
+        """Forward supported callbacks without changing legacy mock interfaces."""
+        self._check_cancelled()
         try:
             parameters = inspect.signature(method).parameters
         except (TypeError, ValueError):
             parameters = {}
+        options = {}
+        if 'on_retry' in parameters:
+            options['on_retry'] = self._retry_log if on_retry is None else on_retry
+        if 'cancel_event' in parameters:
+            options['cancel_event'] = self.cancel_event
         try:
-            if 'on_retry' in parameters:
-                return method(*args, on_retry=self._retry_log)
-            return method(*args)
+            return method(*args, **options)
+        except RequestCancelledError as error:
+            raise CancellationRequested() from error
+
+    def _network_call(self, method, *args):
+        """兼容旧测试或外部替换的无 callback mock。"""
+        try:
+            return self._call_network_method(method, *args)
         except (requests.RequestException, ValueError, TypeError, KeyError,
                 AttributeError) as error:
             raise RetryableTaskError(f'API 请求失败：{error}') from error
@@ -651,6 +664,16 @@ class Operations:
 
     def verify_and_save(self, url_code: str, raw_link: str = '') -> bool:
         """验证链接和转存文件"""
+        task_key = self.next_task_index
+        state = self.unknown_transfer_states.get(task_key)
+        if not self.check_mode and state is not None and self.verify_unknown_transfer(task_key):
+            self.pending_custom_dirs.pop(task_key, None)
+            if not self.custom_mode:
+                self.saved_links.add(url_code)
+            self.insert_logs(
+                f'{ERROR_CODES[0]}：{state.url_code} 转存到：{state.folder_name}'
+            )
+            return True
         if not self.check_mode and not self.custom_mode and url_code in self.saved_links:
             return self.save_file(4, url_code, self.folder_name, raw_link)
         # 验证链接是否有效，返回的数字为错误代码，反之返回参数列表
@@ -756,7 +779,7 @@ class Operations:
             )
             if state.cancel_event.is_set():
                 raise CancellationRequested()
-            state.result = parse_response(response)
+            state.result = self._share_page_params(response)
         except Exception as error:
             state.error = error
         finally:
@@ -774,6 +797,8 @@ class Operations:
                 bdclnd = self._network_call(
                     self.network.verify_pass_code, url, password
                 )
+            except CancellationRequested:
+                raise
             except Exception as error:
                 raise RetryableTaskError(f'验证提取码请求失败：{error}') from error
             # 如果 bdclnd 是错误代码，直接返回
@@ -789,9 +814,17 @@ class Operations:
         # 直接访问没有提取码的链接，或更新 bdclnd 后再次访问，获取转存必须的 3 个参数
         try:
             response = self._network_call(self.network.get_transfer_params, url)
+        except CancellationRequested:
+            raise
         except Exception as error:
             raise RetryableTaskError(f'获取分享页面请求失败：{error}') from error
         # 这里不考虑网络异常了，假设请求一定会返回页面内容，对其进行解析
+        return self._share_page_params(response)
+
+    @staticmethod
+    def _share_page_params(response: str) -> Union[List[Any], int]:
+        if isinstance(response, ParsedTransferPage):
+            return response.parsed
         return parse_response(response)
 
     def check_only(self, result: Union[List[Any], int], url_code: str) -> None:
@@ -808,6 +841,7 @@ class Operations:
         if not folder_name:
             raise ValueError('必须输入转存目录')
         # 对原始输入进行分割
+        raw_link = re.sub(r'^\s*链接\s*[:：]\s*', '', raw_link)
         link_org_sep = raw_link.split()
         # Explicit directory prefixes are preserved; bare URLs use a link counter.
         custom_folder = link_org_sep[0] if link_org_sep else ''
@@ -942,7 +976,9 @@ class Operations:
             self.insert_logs(f'转存失败（{reason}），正在第 {attempt} 次尝试：{url_code}')
 
         try:
-            result = self.network.transfer_file(params, folder_name, on_retry=on_retry)
+            result = self._call_network_method(
+                self.network.transfer_file, params, folder_name, on_retry=on_retry,
+            )
         except RetryExhaustedError as error:
             # Explicit errno responses do not imply that a write was applied.
             # Preserve a previous ambiguity, but do not invent a new one.
