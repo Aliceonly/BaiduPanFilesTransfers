@@ -66,6 +66,7 @@ def make_root(raw_links):
         label_status=DummyWidget(),
         bottom_share=DummyWidget(),
         bottom_save=DummyWidget(),
+        button_copy_share=DummyWidget(),
     )
 
 
@@ -131,6 +132,141 @@ def test_sharing_then_pasting_links_does_not_keep_placeholder_state():
 
     assert operation.valid_link_count == 1
     assert operation.next_task_index == 1
+
+
+@pytest.mark.parametrize("random_password", [False, True])
+def test_copy_share_results_contains_only_successful_links_in_order(monkeypatch, random_password):
+    operation = make_save_operation("example links")
+    operation.network.get_dir_list = lambda *_args: [
+        {"isdir": index % 2, "server_filename": f"item-{index}", "fs_id": index}
+        for index in range(4)
+    ]
+    responses = iter([
+        "https://pan.baidu.com/s/1first", -6, UNKNOWN_RESULT,
+        "https://pan.baidu.com/s/1last",
+    ])
+    codes = iter(["abcd", "2345", "efgh", "6789"])
+    monkeypatch.setattr("src.operations.generate_code", lambda: next(codes))
+    passwords = []
+
+    def create_share(_fs_id, _expiry, password):
+        assert operation.root.button_copy_share.options["state"] == "disabled"
+        passwords.append(password)
+        return next(responses)
+
+    operation.network.create_share = create_share
+    operation.share(SimpleNamespace(result=("永久", "1234", random_password)))
+    clipboard = ["old clipboard"]
+    operation.root.clipboard_clear = clipboard.clear
+    operation.root.clipboard_append = clipboard.append
+    operation.copy_share_results()
+
+    expected = [
+        f"https://pan.baidu.com/s/1first?pwd={passwords[0]}",
+        f"https://pan.baidu.com/s/1last?pwd={passwords[3]}",
+    ]
+    assert operation.share_results == expected
+    assert clipboard == ["\n".join(expected)]
+    assert passwords == (["abcd", "2345", "efgh", "6789"] if random_password else ["1234"] * 4)
+    assert operation.root.button_copy_share.options["state"] == "normal"
+    assert operation.root.label_status.options["text"] == "已复制 2 条分享结果"
+    assert operation.completed_task_count == 4
+    assert "分享失败" in operation.root.text_logs.value
+    assert "分享结果未知" in operation.root.text_logs.value
+
+
+@pytest.mark.parametrize("response", [-6, UNKNOWN_RESULT, ValueError("bad response")])
+def test_share_without_success_keeps_copy_disabled_and_clipboard_untouched(response):
+    operation = make_save_operation("")
+    operation.network.get_dir_list = lambda *_args: [
+        {"isdir": 0, "server_filename": "file", "fs_id": 1},
+    ]
+
+    def create_share(*_args):
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    operation.network.create_share = create_share
+    operation.share(SimpleNamespace(result=("永久", "1234", False)))
+    clipboard = ["keep this"]
+    operation.root.clipboard_clear = clipboard.clear
+    operation.root.clipboard_append = clipboard.append
+    operation.copy_share_results()
+
+    assert operation.share_results == []
+    assert operation.root.button_copy_share.options["state"] == "disabled"
+    assert clipboard == ["keep this"]
+
+
+@pytest.mark.parametrize("task", ["save", "share", "successful_share"])
+def test_starting_another_task_clears_old_share_results(task):
+    operation = make_save_operation("https://pan.baidu.com/s/1input 1234")
+    operation.share_results = ["https://pan.baidu.com/s/1old?pwd=1234"]
+    operation.change_status("stopped")
+    assert operation.root.button_copy_share.options["state"] == "normal"
+
+    if task == "save":
+        operation.save()
+    else:
+        operation.network.get_dir_list = lambda *_args: [
+            {"isdir": 0, "server_filename": "file", "fs_id": 1},
+        ]
+        response = "https://pan.baidu.com/s/1new" if task == "successful_share" else -6
+        operation.network.create_share = lambda *_args: response
+        operation.share(SimpleNamespace(result=("永久", "1234", False)))
+
+    expected = ["https://pan.baidu.com/s/1new?pwd=1234"] if task == "successful_share" else []
+    assert operation.share_results == expected
+    assert operation.root.button_copy_share.options["state"] == ("normal" if expected else "disabled")
+
+
+def test_clipboard_failure_reports_error_without_discarding_share_results():
+    operation = make_save_operation("")
+    operation.share_results = ["https://pan.baidu.com/s/1first?pwd=1234"]
+    operation.change_status("stopped")
+    clipboard = ["old clipboard"]
+    operation.root.clipboard_clear = clipboard.clear
+
+    def fail_clipboard_append(_content):
+        raise RuntimeError("clipboard unavailable")
+
+    operation.root.clipboard_append = fail_clipboard_append
+    operation.copy_share_results()
+
+    assert operation.root.label_status.options["text"] == "复制失败，请重试"
+    assert operation.root.button_copy_share.options["state"] == "normal"
+    assert operation.share_results == ["https://pan.baidu.com/s/1first?pwd=1234"]
+
+    operation.root.clipboard_append = clipboard.append
+    operation.copy_share_results()
+    assert clipboard == operation.share_results
+
+
+def test_copy_share_results_dispatches_clipboard_access_to_the_ui_thread():
+    operation = make_save_operation("")
+    operation.share_results = ["https://pan.baidu.com/s/1first?pwd=1234"]
+    callbacks = []
+    operation.root.after = lambda _delay, callback: callbacks.append(callback)
+    clipboard = ["old clipboard"]
+    clipboard_threads = []
+    operation.root.clipboard_clear = clipboard.clear
+
+    def append_to_clipboard(content):
+        clipboard_threads.append(threading.current_thread())
+        clipboard.append(content)
+
+    operation.root.clipboard_append = append_to_clipboard
+    worker = threading.Thread(target=operation.copy_share_results)
+    worker.start()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert clipboard == ["old clipboard"]
+    assert len(callbacks) == 1
+    callbacks[0]()
+    assert clipboard == operation.share_results
+    assert clipboard_threads == [operation._ui_thread]
 
 
 def test_unknown_transfer_result_keeps_current_directory_and_checkpoint():

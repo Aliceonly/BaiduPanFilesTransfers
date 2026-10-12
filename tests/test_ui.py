@@ -6,12 +6,27 @@ import pytest
 pytest.importorskip("tkinter")
 
 from scripts.smoke_gui import main
-from src.ui import TextEditor
+from src.ui import MainWindow, TextEditor
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Native Windows GUI regression")
 def test_main_window_and_share_dialog_open():
     main()
+
+
+def test_copy_button_invokes_the_operations_callback():
+    calls = []
+    root = SimpleNamespace(
+        op=SimpleNamespace(copy_share_results=lambda: calls.append(True)),
+    )
+
+    MainWindow._copy_button_click(root)
+
+    assert calls == [True]
+
+
+def test_copy_button_does_not_require_operations_during_window_initialization():
+    MainWindow._copy_button_click(SimpleNamespace(op=None))
 
 
 @pytest.mark.parametrize("value", ["real links", "placeholder"])

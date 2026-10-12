@@ -67,10 +67,17 @@ class MainWindow(ttk.Window):
         self.bottom_share = self._create_button(LABEL_MAP['share'], self._share_button_click, 0)
         self.bottom_save = self._create_button(LABEL_MAP['save'], self._save_button_click, 1)
         # 状态标签
+        self.frame_status = ttk.Frame(self)
+        self.frame_status.grid(row=init_row + 7, sticky='e', padx=MW_PADDING, pady=MW_PADDING)
         # noinspection PyArgumentList
-        self.label_status = ttk.Label(self, text=LABEL_MAP['help'], font=('', 10, 'underline'), bootstyle='primary', cursor='heart')
-        self.label_status.grid(row=init_row + 7, sticky='e', padx=MW_PADDING, pady=MW_PADDING)
+        self.label_status = ttk.Label(self.frame_status, text=LABEL_MAP['help'], font=('', 10, 'underline'), bootstyle='primary', cursor='heart')
+        self.label_status.grid(row=0, column=0, padx=(0, 10))
         self.label_status.bind("<Button-1>", lambda e: webbrowser.open(HOME_PAGE))
+        self.button_copy_share = ttk.Button(
+            self.frame_status, text=LABEL_MAP['copy_share'],
+            command=self._copy_button_click, state='disabled',
+        )
+        self.button_copy_share.grid(row=0, column=1)
 
     def _create_entry(self, row: int, label_text: str) -> ttk.Entry:
         """建立标签和输入框函数"""
@@ -108,6 +115,11 @@ class MainWindow(ttk.Window):
     def _share_button_click(self) -> None:
         """当按钮被点击时，调用逻辑处理对象的批量分享方法"""
         self.op.start_share()
+
+    def _copy_button_click(self) -> None:
+        """当按钮被点击时，复制最近一次批量分享生成的链接"""
+        if self.op is not None:
+            self.op.copy_share_results()
 
     def _on_close(self) -> None:
         """请求 worker 退出后再销毁 Tk root。"""

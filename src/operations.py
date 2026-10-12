@@ -103,6 +103,7 @@ class Operations:
         self.prefetch_states: Dict[Tuple[str, str], PrefetchState] = {}
         self.cookie_generation = 0
         self.saved_links = set()
+        self.share_results: List[str] = []
         self.link_list = []
         self.link_list_org = []
         self.next_task_index = 0
@@ -139,6 +140,26 @@ class Operations:
 
     def is_worker_alive(self) -> bool:
         return bool(self.worker_thread and self.worker_thread.is_alive())
+
+    def copy_share_results(self) -> None:
+        """复制本轮成功生成的分享链接，避免把 retry 或失败日志混入结果。"""
+        if not self.share_results:
+            return
+        content = '\n'.join(self.share_results)
+        result_count = len(self.share_results)
+
+        def copy_to_clipboard():
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(content)
+            except Exception:
+                self.root.label_status.config(text='复制失败，请重试', bootstyle='danger')
+                return
+            self.root.label_status.config(
+                text=f'已复制 {result_count} 条分享结果', bootstyle='success',
+            )
+
+        self._ui_call(copy_to_clipboard)
 
     def request_cancel(self) -> None:
         """通知 worker 尽快退出，暂停等待也会被立即唤醒。"""
@@ -369,6 +390,7 @@ class Operations:
             self.unknown_transfer_states = {}
             self.destination_baselines = {}
             self.saved_links = set()
+            self.share_results = []
             self.link_list = []
             self.link_list_org = []
             self.next_task_index = 0
@@ -561,7 +583,9 @@ class Operations:
             if r == UNKNOWN_RESULT:
                 result = f'分享结果未知：{msg}'
             elif isinstance(r, str):
-                result = f'分享成功：{r}?pwd={password} {msg}'
+                share_link = f'{r}?pwd={password}'
+                self.share_results.append(share_link)
+                result = f'分享成功：{share_link} {msg}'
             else:
                 result = f'分享失败：错误代码（{r}） {msg}'
             self.insert_logs(result)
@@ -622,6 +646,10 @@ class Operations:
                 command=self.start_save,
             )
             self.root.bottom_share.config(state="normal", command=self.start_share)
+
+        self.root.button_copy_share.config(
+            state='normal' if status == 'stopped' and self.share_results else 'disabled',
+        )
 
     def check_condition(self, condition: bool, message: str) -> None:
         """
