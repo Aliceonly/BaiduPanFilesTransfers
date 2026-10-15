@@ -17,6 +17,7 @@ import tempfile
 import threading
 import zlib
 from typing import Any, Union, Tuple, Callable, List, Optional, Dict
+from urllib.parse import parse_qs, urlsplit
 
 from src.constants import CONFIG_PATH, ICON_BASE64
 
@@ -26,6 +27,10 @@ USER_ID_REGEX = re.compile(r'"share_uk"\s*:\s*"?(\d+)"?\s*[,}]')
 FS_ID_REGEX = re.compile(r'"fs_id"\s*:\s*"?(\d+)"?\s*[,}]')
 SERVER_FILENAME_REGEX = re.compile(r'"server_filename"\s*:\s*("(?:[^"\\]|\\.)*")\s*[,}]')
 ISDIR_REGEX = re.compile(r'"isdir"\s*:\s*([01])\s*[,}]')
+PASS_CODE_LABEL_REGEX = re.compile(r'提取(?:码(?=\s*[\[（(【A-Za-z0-9])|码?\s*[:：])')
+SHARE_URL_NOTE_REGEX = re.compile(
+    rf'[，。；]|{PASS_CODE_LABEL_REGEX.pattern}|解压(?:密码|码)'
+)
 
 
 class TransferParams(list):
@@ -104,17 +109,29 @@ def normalize_link(url_code: str) -> str:
     :param url_code: 需要处理的的原始链接格式
     :return: 返回标准格式：链接+空格+提取码
     """
-    # 升级旧链接格式
-    normalized = url_code.replace("share/init?surl=", "s/1")
-    # 替换掉 ?pwd= 或 &pwd= 为空格
-    normalized = re.sub(r'[?&]pwd=', ' ', normalized)
-    # 替换掉提取码字样为空格
-    normalized = re.sub(r'提取码*[：:]', ' ', normalized)
-    # 替换 http 为 https，顺便处理掉开头没用的文字
-    normalized = re.sub(r'^.*?(https?://)', 'https://', normalized)
-    # 替换连续的空格
-    normalized = re.sub(r'\s+', ' ', normalized)
-    return normalized
+    # Resolve labeled credentials before dropping notes or labels.
+    url, code = parse_url_and_code(url_code)
+    if url:
+        trailing_space = ' ' if code and url_code[-1:].isspace() else ''
+        return f'{url} {code}{trailing_space}'
+    return re.sub(r'\s+', ' ', url_code)
+
+
+def is_baidu_url(url: str) -> bool:
+    """Allow credentials only on the HTTPS Baidu Pan origin."""
+    if not isinstance(url, str) or re.search(r'[\s\\\x00-\x1f\x7f]', url):
+        return False
+    try:
+        parts = urlsplit(url)
+        return (
+            parts.scheme == 'https'
+            and parts.hostname == 'pan.baidu.com'
+            and parts.port in (None, 443)
+            and parts.username is None
+            and parts.password is None
+        )
+    except ValueError:
+        return False
 
 
 def parse_url_and_code(url_code: str) -> Tuple[str, str]:
@@ -129,26 +146,52 @@ def parse_url_and_code(url_code: str) -> Tuple[str, str]:
 
     # The URL can be preceded by a title. Keep the first URL and parse its
     # query before looking at free-form text after it.
-    url_match = re.search(r'https?://\S+', url_code)
+    url_match = re.search(r'https?://\S+', url_code, re.IGNORECASE)
     if not url_match:
         return '', ''
 
     url_token = url_match.group(0).rstrip('.,，。;；)]）')
+    # Validate the original authority before separating pasted notes; a label
+    # inside an untrusted hostname must never turn it into an allowed origin.
+    if not is_baidu_url(re.sub(r'^http://', 'https://', url_token, flags=re.IGNORECASE)):
+        return '', ''
+    note_match = SHARE_URL_NOTE_REGEX.search(url_token)
+    if note_match:
+        url_token = url_token[:note_match.start()].rstrip('.,，。;；)]）')
     url_end = url_match.start() + len(url_token)
-    query_code = re.search(r'(?:[?&]|%3F|%26)pwd=([A-Za-z0-9]{4})\b', url_token, re.IGNORECASE)
-    if query_code:
-        code = query_code.group(1)
-    else:
-        # Use the first exact four-character token. This avoids treating an
-        # archive password or other trailing note as the Baidu passcode.
-        code_match = re.search(
-            r'(?<![A-Za-z0-9])([A-Za-z0-9]{4})(?![A-Za-z0-9])',
-            url_code[url_end:],
+    url_token = re.sub(r'^http://', 'https://', url_token, flags=re.IGNORECASE)
+    url_token = re.sub(r'%3f', '?', url_token, flags=re.IGNORECASE)
+    url_token = re.sub(r'%26', '&', url_token, flags=re.IGNORECASE)
+    parts = urlsplit(url_token)
+    query = parse_qs(parts.query.replace('?pwd=', '&pwd='), keep_blank_values=True)
+    query = {key.lower(): value for key, value in query.items()}
+    path = parts.path
+    if path == '/share/init':
+        surl = query.get('surl', [''])[0]
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', surl):
+            return '', ''
+        path = f'/s/1{surl}'
+
+    tail = url_code[url_end:]
+    labeled_code = PASS_CODE_LABEL_REGEX.search(tail)
+    if 'pwd' in query:
+        candidate = query['pwd'][0]
+    elif labeled_code:
+        code_match = re.match(
+            r'\s*(?:[\[（(【]\s*)?([A-Za-z0-9]+)', tail[labeled_code.end():],
         )
-        code = code_match.group(1) if code_match else ''
+        candidate = code_match.group(1) if code_match else ''
+    else:
+        # A bare code must immediately follow the URL, not an archive-password note.
+        code_match = re.search(
+            r'^[\s:：,，;；(（\[]*([A-Za-z0-9]{4})(?![A-Za-z0-9])',
+            tail,
+        )
+        candidate = code_match.group(1) if code_match else ''
+    code = candidate if re.fullmatch(r'[A-Za-z0-9]{4}', candidate) else ''
 
     # Keep the historical URL length guard for malformed overlong input.
-    url = url_token.split('?', 1)[0][:47]
+    url = f'https://pan.baidu.com{path}'[:47]
     return url, code
 
 
@@ -231,6 +274,28 @@ def parse_response(response: str) -> Union[List[Any], int]:
         values,
         [metadata_by_id.get(fs_id, {}) for fs_id in files],
     )
+
+
+def is_valid_directory_list(items: Any) -> bool:
+    """Every snapshot entry needs an ID or a complete name/type identity."""
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        file_id = item.get('fs_id')
+        if file_id is not None:
+            if (
+                isinstance(file_id, bool) or not isinstance(file_id, (int, str))
+                or not str(file_id).isascii() or not str(file_id).isdigit()
+            ):
+                return False
+        elif (
+            not isinstance(item.get('server_filename'), str) or not item['server_filename']
+            or str(item.get('isdir')) not in ('0', '1')
+        ):
+            return False
+    return True
 
 
 def is_valid_transfer_params(params: Any) -> bool:

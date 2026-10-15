@@ -32,6 +32,8 @@ from src.utils import (
     parse_url_and_code,
     update_cookie,
     generate_code,
+    is_baidu_url,
+    is_valid_directory_list,
     is_valid_transfer_params,
 )
 
@@ -88,6 +90,7 @@ class Operations:
     """
 
     PREFETCH_WORKERS = 3
+    CUSTOM_TRANSFER_ATTEMPTS = 3
 
     def __init__(self, root):
         self.root = root
@@ -96,6 +99,9 @@ class Operations:
         self.created_dirs = set()
         self.used_custom_dirs = set()
         self.pending_custom_dirs = {}
+        self.custom_directory_numbers = {}
+        self.custom_transfer_paths = {}
+        self.directory_number_hints = {}
         self.unknown_transfer_tasks = set()
         self.unknown_transfer_states: Dict[int, UnknownTransferState] = {}
         self.destination_baselines: Dict[str, List[Dict[str, Any]]] = {}
@@ -283,7 +289,8 @@ class Operations:
             self.handle_input()
             can_resume = True
             self.handle_bdstoken()
-            self.handle_create_dir(folder_name=self.folder_name)
+            if not self.check_mode:
+                self.handle_create_dir(folder_name=self.folder_name)
             if resume:
                 self.insert_logs(f'继续转存：已处理 {self.next_task_index}/{self.total_task_count}，从下一条未处理输入继续。')
                 self.change_status('running')
@@ -293,6 +300,8 @@ class Operations:
             pass
         except CancellationRequested:
             pass
+        except RetryableTaskError as error:
+            self.insert_logs(f'当前批次暂未完成，保留断点：{error}')
         except Exception as e:
             self.insert_logs(f'程序出现未预料错误，信息如下：\n{e}\n{traceback.format_exc()}')
         finally:
@@ -339,6 +348,8 @@ class Operations:
             self.handle_process_share()
         except CancellationRequested:
             pass
+        except RetryableTaskError as error:
+            self.insert_logs(f'批量分享暂未完成，请稍后重试：{error}')
         except Exception as e:
             self.insert_logs(f'程序出现未预料错误，信息如下：\n{e}\n{traceback.format_exc()}')
         finally:
@@ -386,6 +397,9 @@ class Operations:
             self.created_dirs = set()
             self.used_custom_dirs = set()
             self.pending_custom_dirs = {}
+            self.custom_directory_numbers = {}
+            self.custom_transfer_paths = {}
+            self.directory_number_hints = {}
             self.unknown_transfer_tasks = set()
             self.unknown_transfer_states = {}
             self.destination_baselines = {}
@@ -423,13 +437,73 @@ class Operations:
         self.link_list = [normalize_link(f'{link} ') for link in raw_links]
         # Keep the raw and normalized rows aligned. Duplicate rows are valid input.
         self.link_list_org = raw_links
+        self.directory_number_hints = {}
+        pending_title_number = None
+        for index, (raw_link, url_code) in enumerate(zip(raw_links, self.link_list)):
+            has_baidu_link = bool(parse_url_and_code(url_code)[0])
+            if has_baidu_link:
+                # A numbered title on the preceding row belongs to the next
+                # URL when users paste title and link on separate lines.
+                if not self._explicit_directory_name(raw_link):
+                    title_number = self._extract_title_number(raw_link)
+                    if title_number is None:
+                        title_number = pending_title_number
+                    if title_number is not None:
+                        self.directory_number_hints[index] = title_number
+                pending_title_number = None
+            else:
+                pending_title_number = self._extract_title_number(raw_link)
         # Unsupported/title rows remain aligned for logging, but only actual
         # Baidu links count toward SAVE_LIMIT.
         self.valid_link_count = sum(
-            'https://pan.baidu.com/' in link for link in self.link_list
+            bool(parse_url_and_code(link)[0]) for link in self.link_list
         )
         self.total_task_count = len(self.link_list)
         self.change_status('running')
+
+    @staticmethod
+    def _extract_title_number(raw_link: str) -> Optional[int]:
+        """Extract numbered titles without treating a decimal filename as a title."""
+        match = re.match(
+            r'^\s*(?:\[([0-9]+)\]|([0-9]+)\s*(?:[.．](?!\d)|[、)）]))',
+            raw_link or '',
+        )
+        return int(match.group(1) or match.group(2)) if match else None
+
+    @classmethod
+    def _explicit_directory_name(cls, raw_link: str) -> str:
+        """Return a directory prefix explicitly written on the URL row."""
+        cleaned = re.sub(r'^\s*链接\s*[:：]\s*', '', raw_link or '')
+        url_match = re.search(r'https?://\S+', cleaned, re.IGNORECASE)
+        if not url_match:
+            return ''
+        # Only a whitespace-separated prefix names an explicit directory.
+        # Attached text is a title; the URL itself must never enter the path.
+        prefix_match = re.match(r'\s*(\S+)\s+', cleaned[:url_match.start()])
+        if not prefix_match:
+            return ''
+        first_token = prefix_match.group(1)
+        if '/' in first_token:
+            return first_token
+        # Only standalone numbering markers (or a bracketed title) override
+        # a URL-row prefix; names such as "2026.backup" remain explicit paths.
+        if re.fullmatch(r'(?:\[[0-9]+\]|[0-9]+[.．、)）])', first_token) or re.fullmatch(
+            r'[0-9]+[.．、)）](?:\[[^\]]*\])+', first_token,
+        ):
+            return ''
+        return first_token
+
+    def _assign_custom_directory_number(self, task_key: int, raw_link: str) -> int:
+        """Assign one stable numeric identity to the current custom directory."""
+        explicit_name = self._explicit_directory_name(raw_link)
+        title_number = None if explicit_name else self.directory_number_hints.get(task_key)
+        if title_number is None:
+            self.custom_dir_count += 1
+            title_number = self.custom_dir_count
+        else:
+            self.custom_dir_count = max(self.custom_dir_count, title_number)
+        self.custom_directory_numbers[task_key] = title_number
+        return title_number
 
     def setup_share(self) -> None:
         """准备参数，更新状态"""
@@ -468,7 +542,9 @@ class Operations:
         self.dir_list_all = self._network_call(
             self.network.get_dir_list, f'/{self.folder_name}'
         )
-        self.check_condition(isinstance(self.dir_list_all, int) or not self.dir_list_all,
+        if self.dir_list_all == UNKNOWN_RESULT:
+            raise RetryableTaskError(f'无法确认目录 {self.folder_name} 的内容')
+        self.check_condition(not isinstance(self.dir_list_all, list) or not self.dir_list_all,
                              message=f'目录 {self.folder_name} 中没获取到任何内容，请求返回：{self.dir_list_all}')
 
     def handle_create_dir(self, folder_name: str, require_empty: bool = False) -> bool:
@@ -479,21 +555,21 @@ class Operations:
             return True
 
         if require_empty:
-            # New custom directories need only one request. An existing path
-            # is checked below before the caller selects another name.
+            # A successful create response does not prove the path was new.
+            # Re-list it before transferring so an existing non-empty path is
+            # never mistaken for the current task's empty directory.
             return_code = self._network_call(self.network.create_dir, folder_name)
             if return_code == 0:
                 self.created_dirs.add(folder_name)
-                return True
-            if return_code == UNKNOWN_RESULT:
+            elif return_code == UNKNOWN_RESULT:
                 raise RetryableTaskError(f'创建目录结果未知：{folder_name}')
-            if return_code not in (-8, 4):
+            elif return_code not in (-8, 4):
                 raise PermanentTaskError(f'创建目录失败，错误代码：{return_code}')
 
         result = self._network_call(self.network.get_dir_list, f'/{folder_name}')
+        if result == UNKNOWN_RESULT:
+            raise RetryableTaskError(f'无法确认目录状态：{folder_name}')
         if require_empty:
-            if result == UNKNOWN_RESULT:
-                raise RetryableTaskError(f'无法确认目录状态：{folder_name}')
             if not isinstance(result, list):
                 raise RetryableTaskError(f'无法检查目录 {folder_name}，请求返回：{result}')
             return not result
@@ -543,7 +619,7 @@ class Operations:
         """执行转存操作并记录结果"""
         try:
             # 跳过非网盘链接
-            if 'https://pan.baidu.com/' not in url_code:
+            if not parse_url_and_code(url_code)[0]:
                 self.insert_logs(f'不支持的链接：{url_code}')
                 return True
             else:
@@ -716,6 +792,8 @@ class Operations:
     def get_cached_transfer_params(self, url_code: str) -> Union[List[Any], int]:
         """按分享 URL 和提取码缓存验证结果，减少重复页面请求。"""
         url, password = parse_url_and_code(url_code)
+        if not url:
+            return -1
         cache_key = (url, password)
         prefetch = self.prefetch_states.get(cache_key)
         if prefetch is not None:
@@ -772,7 +850,7 @@ class Operations:
             if pending_count >= self.PREFETCH_WORKERS:
                 break
             url, password = parse_url_and_code(self.link_list[index])
-            if password or 'https://pan.baidu.com/' not in url:
+            if password or not url:
                 continue
             cache_key = (url, password)
             if cache_key in self.transfer_params_cache or cache_key in self.prefetch_states:
@@ -819,6 +897,8 @@ class Operations:
 
     def verify_link(self, url: str, password: str) -> Union[List[Any], int]:
         """验证链接有效性，验证通过返回转存所需参数列表"""
+        if not is_baidu_url(url):
+            return -1
         # 对于有提取码的链接先验证提取码，试图获取更新 bdclnd
         if password:
             try:
@@ -868,12 +948,10 @@ class Operations:
         """按当前链接创建空目录，不依赖输入行数或其他行的标题。"""
         if not folder_name:
             raise ValueError('必须输入转存目录')
-        # 对原始输入进行分割
-        raw_link = re.sub(r'^\s*链接\s*[:：]\s*', '', raw_link)
-        link_org_sep = raw_link.split()
-        # Explicit directory prefixes are preserved; bare URLs use a link counter.
-        custom_folder = link_org_sep[0] if link_org_sep else ''
-        numeric_name = not custom_folder or 'pan.baidu.com' in custom_folder
+        # Explicit directory prefixes are preserved; bare URLs use a stable
+        # number assigned to the current task.
+        custom_folder = self._explicit_directory_name(raw_link)
+        numeric_name = not custom_folder
         custom_folder = str(directory_number) if numeric_name else custom_folder
         folder_name = f'{folder_name}/{custom_folder}'
         # 此处用替换处理目标目录名非法字符，不报错了
@@ -883,13 +961,11 @@ class Operations:
         for offset in range(SAVE_LIMIT):
             if offset:
                 folder_name = (
-                    f'{base_path.rsplit("/", 1)[0]}/{directory_number + offset}'
+                    f'{base_path.rsplit("/", 1)[0]}/{directory_number}_{offset + 1}'
                     if numeric_name else f'{base_path}_{offset + 1}'
                 )
             task_key = self.next_task_index
             self.pending_custom_dirs[task_key] = folder_name
-            if numeric_name:
-                self.custom_dir_count = directory_number + offset
             try:
                 directory_available = self.handle_create_dir(folder_name, require_empty=True)
             except PermanentTaskError:
@@ -916,6 +992,11 @@ class Operations:
             if self.custom_mode:
                 transfer_params = result
                 task_key = self.next_task_index
+                directory_number = self.custom_directory_numbers.get(task_key)
+                if directory_number is None:
+                    directory_number = self._assign_custom_directory_number(
+                        task_key, raw_link or url_code,
+                    )
                 pending_folder = self.pending_custom_dirs.get(task_key)
                 if pending_folder and pending_folder not in self.used_custom_dirs:
                     # A pending path may have been recorded before creation
@@ -935,22 +1016,30 @@ class Operations:
                 if pending_folder:
                     folder_name = pending_folder
                 else:
-                    self.custom_dir_count += 1
                     folder_name = self.creat_user_dir(
-                        folder_name, raw_link or url_code, self.custom_dir_count
+                        folder_name, raw_link or url_code, directory_number
                     )
                     self.pending_custom_dirs[task_key] = folder_name
-                result = self.transfer_with_logs(transfer_params, folder_name, url_code)
-                if result in (-8, 4):
-                    # A previous request or another client may have populated
-                    # the path. Use a fresh empty directory once.
-                    self.insert_logs(f'目录存在同名文件，改用新的空目录重试：{folder_name}')
-                    self.custom_dir_count += 1
-                    folder_name = self.creat_user_dir(
-                        self.folder_name, raw_link or url_code, self.custom_dir_count
-                    )
-                    self.pending_custom_dirs[task_key] = folder_name
+                attempted_paths = self.custom_transfer_paths.setdefault(task_key, set())
+                while True:
+                    if folder_name not in attempted_paths and len(attempted_paths) >= self.CUSTOM_TRANSFER_ATTEMPTS:
+                        result = 4
+                        break
+                    attempted_paths.add(folder_name)
                     result = self.transfer_with_logs(transfer_params, folder_name, url_code)
+                    if result not in (-8, 4) or len(attempted_paths) >= self.CUSTOM_TRANSFER_ATTEMPTS:
+                        break
+                    # Another client can write between the empty check and
+                    # the transfer. Retry only definite collisions, never an
+                    # ambiguous write, and keep the task's stable number.
+                    self.insert_logs(
+                        f'目录存在同名文件，改用新的空目录重试：{folder_name}'
+                        f'（第 {len(attempted_paths) + 1}/{self.CUSTOM_TRANSFER_ATTEMPTS} 个目录）'
+                    )
+                    folder_name = self.creat_user_dir(
+                        self.folder_name, raw_link or url_code, directory_number
+                    )
+                    self.pending_custom_dirs[task_key] = folder_name
                 if result == UNKNOWN_RESULT:
                     self.insert_logs(
                         f'转存结果未知，保留当前目录，不自动更换目录：{url_code} 转存到：{folder_name}'
@@ -987,6 +1076,12 @@ class Operations:
         if task_key in self.unknown_transfer_states:
             if self.verify_unknown_transfer(task_key):
                 return 0
+            original = self.unknown_transfer_states[task_key].params
+            if not self._same_transfer_source(original, params):
+                self.insert_logs(
+                    f'分享内容已变化或 metadata 不完整，保留原任务和目录：{folder_name}'
+                )
+                return UNKNOWN_RESULT
         elif not self.custom_mode and self._expected_transfer_items(params) is not None:
             # The batch-start snapshot may predate writes from another client.
             # Custom paths already have a confirmed empty baseline at creation.
@@ -996,7 +1091,7 @@ class Operations:
                 )
             except RetryableTaskError:
                 baseline = None
-            baseline_known = isinstance(baseline, list)
+            baseline_known = is_valid_directory_list(baseline)
             if baseline_known:
                 self.destination_baselines[folder_name] = list(baseline)
 
@@ -1049,6 +1144,29 @@ class Operations:
         )
 
     @staticmethod
+    def _same_transfer_source(original: List[Any], current: List[Any]) -> bool:
+        """A new request must still refer to every item in the unknown write."""
+        if original[:2] != current[:2]:
+            return False
+        if Counter(zip(*original[2:])) != Counter(zip(*current[2:])):
+            return False
+        original_items = Operations._source_transfer_items(original)
+        current_items = dict(zip(current[2], Operations._source_transfer_items(current)))
+        for file_id, item in zip(original[2], original_items):
+            refreshed = current_items[file_id]
+            for field in ('size', 'md5'):
+                if item.get(field) is None:
+                    continue
+                if refreshed.get(field) is None:
+                    return False
+                before, after = str(item[field]), str(refreshed[field])
+                if field == 'md5':
+                    before, after = before.lower(), after.lower()
+                if before != after:
+                    return False
+        return True
+
+    @staticmethod
     def _transfer_item_key(item: Dict[str, Any]) -> Tuple[str, str]:
         """Normalize a directory-list item for conservative comparison."""
         return (
@@ -1099,7 +1217,10 @@ class Operations:
     def verify_unknown_transfer(self, task_key: int) -> bool:
         """Check whether an ambiguous transfer is already visible in its target."""
         state = self.unknown_transfer_states.get(task_key)
-        if state is None or not state.baseline_known:
+        if (
+            state is None or not state.baseline_known
+            or not is_valid_directory_list(state.baseline_items)
+        ):
             return False
         expected_counts = self._expected_transfer_items(state.params)
         if expected_counts is None:
@@ -1112,7 +1233,7 @@ class Operations:
             )
         except (RetryableTaskError, PermanentTaskError):
             return False
-        if not isinstance(current, list):
+        if not is_valid_directory_list(current):
             return False
 
         baseline_counts = Counter(

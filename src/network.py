@@ -10,11 +10,15 @@ import random
 import threading
 import time
 from typing import Union, List, Any, Callable, Optional
+from urllib.parse import urljoin
 
 import requests
 
 from src.constants import HEADERS, BASE_URL
-from src.utils import is_permanent_share_error, is_valid_transfer_params, parse_response
+from src.utils import (
+    is_baidu_url, is_permanent_share_error, is_valid_directory_list,
+    is_valid_transfer_params, parse_response,
+)
 
 
 REQUEST_ATTEMPTS = 5
@@ -29,6 +33,10 @@ RetryCallback = Optional[Callable[[int, Any], None]]
 
 class RequestCancelledError(RuntimeError):
     """A cancelled request must not start another retry."""
+
+
+class UnsafeShareUrlError(RuntimeError):
+    """A share page attempted to leave the permitted credential origin."""
 
 
 class RetryExhaustedError(requests.RequestException):
@@ -59,8 +67,6 @@ class Network:
         self.s = requests.Session()
         self.headers = HEADERS.copy()
         self.bdstoken = ''
-        # 保留现有兼容行为：程序目前仍关闭 TLS certificate verification。
-        requests.packages.urllib3.disable_warnings()
 
     def reset_session(self) -> None:
         """恢复中断批次时重建 Session，保留 headers 中的运行时 Cookie。"""
@@ -215,7 +221,7 @@ class Network:
         payload = self._request_json(
             lambda: self.s.get(
                 url=url, params=params, headers=self.headers, timeout=10,
-                allow_redirects=False, verify=False,
+                allow_redirects=False, verify=True,
             ),
             on_retry=on_retry,
             validator=validate,
@@ -234,7 +240,7 @@ class Network:
         folder_name: str,
         on_retry: RetryCallback = None,
         cancel_event: Optional[threading.Event] = None,
-    ) -> Union[List[Any], int]:
+    ) -> Union[List[Any], int, str]:
         """获取目录的完整列表，自动请求所有 pagination pages。"""
         url = f'{BASE_URL}/api/list'
         page_size = 1000
@@ -275,8 +281,8 @@ class Network:
 
             def validate(payload):
                 current = payload.get('list')
-                if not isinstance(current, list):
-                    raise ValueError('目录列表 response 无效')
+                if not is_valid_directory_list(current):
+                    raise ValueError('目录列表 response 无效或条目缺少有效身份信息')
                 if current:
                     if json.dumps(current, sort_keys=True) in seen_pages:
                         raise ValueError(f'目录 pagination 返回了重复页面：{page}')
@@ -291,14 +297,14 @@ class Network:
             payload = self._request_json(
                 lambda params=params: self.s.get(
                     url=url, params=params, headers=self.headers, timeout=15,
-                    allow_redirects=False, verify=False,
+                    allow_redirects=False, verify=True,
                 ),
                 on_retry=on_retry,
                 validator=validate,
                 cancel_event=cancel_event,
             )
             if payload == UNKNOWN_RESULT:
-                return -1
+                return UNKNOWN_RESULT
             if isinstance(payload, int):
                 return payload
 
@@ -345,7 +351,7 @@ class Network:
         payload = self._request_json(
             lambda: self.s.post(
                 url=url, params=params, headers=self.headers, data=data, timeout=15,
-                allow_redirects=False, verify=False,
+                allow_redirects=False, verify=True,
             ),
             on_retry=on_retry,
             unknown_on_exhaustion=True,
@@ -384,7 +390,7 @@ class Network:
         payload = self._request_json(
             lambda: self.s.post(
                 url=url, params=params, headers=self.headers, data=data, timeout=10,
-                allow_redirects=False, verify=False,
+                allow_redirects=False, verify=True,
             ),
             on_retry=on_retry,
             validator=validate,
@@ -404,7 +410,9 @@ class Network:
         on_retry: RetryCallback = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> str:
-        """请求分享页面，获取转存所需的原始 response。"""
+        """请求分享页面，仅跟随同一 HTTPS origin 的 redirect。"""
+        if not is_baidu_url(url):
+            return ParsedTransferPage('', -1)
         parsed = -1
 
         def validate(text):
@@ -413,12 +421,36 @@ class Network:
             if not is_valid_transfer_params(parsed) and not is_permanent_share_error(text):
                 raise ValueError('分享页面缺少有效的转存参数')
 
-        text = self._request_text(
-            lambda: self.s.get(url=url, headers=self.headers, timeout=15, verify=False),
-            on_retry=on_retry,
-            validator=validate,
-            cancel_event=cancel_event,
-        )
+        def request_page():
+            target = url
+            for _ in range(6):
+                self._check_cancelled(cancel_event)
+                if not is_baidu_url(target):
+                    raise UnsafeShareUrlError('拒绝向非百度网盘 HTTPS 地址发送 Cookie')
+                response = self.s.get(
+                    url=target, headers=self.headers, timeout=15,
+                    verify=True, allow_redirects=False,
+                )
+                if getattr(response, 'status_code', 200) not in (301, 302, 303, 307, 308):
+                    return response
+                location = response.headers.get('Location')
+                close = getattr(response, 'close', None)
+                if callable(close):
+                    close()
+                if not isinstance(location, str) or not location:
+                    raise ValueError('分享页面 redirect 缺少 Location')
+                target = urljoin(target, location)
+            raise requests.TooManyRedirects('分享页面 redirect 次数过多')
+
+        try:
+            text = self._request_text(
+                request_page,
+                on_retry=on_retry,
+                validator=validate,
+                cancel_event=cancel_event,
+            )
+        except UnsafeShareUrlError:
+            return ParsedTransferPage('', -1)
         return ParsedTransferPage(text, parsed)
 
     def transfer_file(
@@ -453,7 +485,7 @@ class Network:
         payload = self._request_json(
             lambda: self.s.post(
                 url=url, params=params, headers=self.headers, data=data,
-                timeout=30, allow_redirects=False, verify=False,
+                timeout=30, allow_redirects=False, verify=True,
             ),
             on_retry=on_retry,
             unknown_on_exhaustion=True,
@@ -498,7 +530,7 @@ class Network:
         payload = self._request_json(
             lambda: self.s.post(
                 url=url, params=params, headers=self.headers, data=data, timeout=15,
-                allow_redirects=False, verify=False,
+                allow_redirects=False, verify=True,
             ),
             on_retry=on_retry,
             unknown_on_exhaustion=True,
@@ -526,7 +558,7 @@ def _create_dir_once(network: Network, folder_name: str) -> int:
     }
     response = network.s.post(
         url=url, params=params, headers=network.headers, data=data, timeout=15,
-        allow_redirects=False, verify=False,
+        allow_redirects=False, verify=True,
     )
     payload = response.json()
     errno = payload['errno']

@@ -34,12 +34,12 @@ from src.utils import *
     ("文件名 https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA fm9k ", "https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA fm9k "),
     # 测试删除链接开头多余文字，没有空格
     ("文件名https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA fm9k ", "https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA fm9k "),
-    # 测试默认生成的分享链接
-    ("https://pan.baidu.com/s/1vlSFT4aruIb3LtxZrtjOZg?pwd=6xmb 提取码: 6xmb", "https://pan.baidu.com/s/1vlSFT4aruIb3LtxZrtjOZg 6xmb 6xmb"),
-    # 测试保留有效链接之后的无用文字
-    ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA?pwd=abcd efgh ", "https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA abcd efgh "),
-    # 综合测试
-    ("1中文4abhttp://pan.baidu.com/share/init?surl=82A8FJ02gCq1MWYyrm_emA?pwd=abcd 提取码: efgh ", "https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA abcd efgh "),
+    # 默认生成的分享链接只保留一份提取码
+    ("https://pan.baidu.com/s/1vlSFT4aruIb3LtxZrtjOZg?pwd=6xmb 提取码: 6xmb", "https://pan.baidu.com/s/1vlSFT4aruIb3LtxZrtjOZg 6xmb"),
+    # 清除无用文字，优先使用 URL query 中的 pwd
+    ("https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA?pwd=abcd efgh ", "https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA abcd "),
+    # 旧链接格式也遵循同一提取码优先级
+    ("1中文4abhttp://pan.baidu.com/share/init?surl=82A8FJ02gCq1MWYyrm_emA?pwd=abcd 提取码: efgh ", "https://pan.baidu.com/s/182A8FJ02gCq1MWYyrm_emA abcd "),
 ])
 def test_normalize_link(url_code, expected):
     """测试正则表达式清洗输入链接"""

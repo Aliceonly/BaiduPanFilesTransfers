@@ -5,7 +5,7 @@ import pytest
 import requests
 
 from src.network import Network, ParsedTransferPage, RequestCancelledError, UNKNOWN_RESULT
-from src.utils import parse_response, parse_url_and_code
+from src.utils import normalize_link, parse_response, parse_url_and_code
 
 
 class FakeResponse:
@@ -56,6 +56,166 @@ def test_transfer_file_retries_nonzero_errno(monkeypatch):
 
     assert result == 0
     assert network.s.calls == 2
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.invalid/x",
+    "https://pan.baidu.com.example.invalid/s/1first",
+    "https://pan.baidu.com@example.invalid/s/1first",
+    "https://example.invalid/?next=https://pan.baidu.com/s/1first",
+    "https://pan.baidu.com:444/s/1first",
+    "https://user:password@pan.baidu.com/s/1first",
+    "http://pan.baidu.com/s/1first",
+])
+def test_share_page_rejects_untrusted_origin_before_sending_cookies(url):
+    network = Network()
+    network.headers["Cookie"] = "BAIDUID=dummy"
+    network.s = FakeSession([])
+
+    result = network.get_transfer_params(url)
+
+    assert result.parsed == -1
+    assert network.s.calls == 0
+
+
+@pytest.mark.parametrize("location", [
+    "https://example.invalid/x", "//example.invalid/x",
+    "http://pan.baidu.com/s/1next", "https://pan.baidu.com:444/s/1next",
+    "https://pan.baidu.com@example.invalid/x",
+])
+def test_share_page_blocks_untrusted_redirects(location):
+    network = Network()
+    redirect = FakeResponse(0, content=SHARE_PAGE)
+    redirect.status_code = 302
+    redirect.headers = {"Location": location}
+    network.s = FakeSession([redirect])
+
+    result = network.get_transfer_params("https://pan.baidu.com/s/1first")
+
+    assert result.parsed == -1
+    assert network.s.calls == 1
+    assert network.s.requests[0]["allow_redirects"] is False
+
+
+@pytest.mark.parametrize("location", ["/s/1next", "https://pan.baidu.com/s/1next"])
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+def test_share_page_follows_trusted_redirects_explicitly(location, status_code):
+    network = Network()
+    redirect = FakeResponse(0, content=SHARE_PAGE)
+    redirect.status_code = status_code
+    redirect.headers = {"Location": location}
+    network.s = FakeSession([redirect, FakeResponse(0, content=SHARE_PAGE)])
+
+    result = network.get_transfer_params("https://pan.baidu.com/s/1first")
+
+    assert result.parsed == ["123", "456", ["789"], ["file"], ["0"]]
+    assert [request["url"] for request in network.s.requests] == [
+        "https://pan.baidu.com/s/1first", "https://pan.baidu.com/s/1next",
+    ]
+    assert all(request["allow_redirects"] is False for request in network.s.requests)
+
+
+def test_share_page_redirect_loop_stops_after_bounded_retries(monkeypatch):
+    network = Network()
+    redirect = FakeResponse(0, content=SHARE_PAGE)
+    redirect.status_code = 302
+    redirect.headers = {"Location": "/s/1first"}
+    closed = []
+    redirect.close = lambda: closed.append(True)
+    network.s = FakeSession([redirect] * 30)
+    retries = []
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(requests.TooManyRedirects):
+        network.get_transfer_params(
+            "https://pan.baidu.com/s/1first",
+            on_retry=lambda attempt, reason: retries.append((attempt, reason)),
+        )
+
+    assert network.s.calls == 30
+    assert len(closed) == 30
+    assert retries == [(attempt, "TooManyRedirects") for attempt in range(2, 6)]
+
+
+def test_share_page_cancellation_during_redirect_stops_the_next_request():
+    network = Network()
+    cancelled = threading.Event()
+    redirect = FakeResponse(0, content=SHARE_PAGE)
+    redirect.status_code = 302
+    redirect.headers = {"Location": "/s/1next"}
+    redirect.close = cancelled.set
+    network.s = FakeSession([redirect])
+
+    with pytest.raises(RequestCancelledError):
+        network.get_transfer_params(
+            "https://pan.baidu.com/s/1first", cancel_event=cancelled,
+        )
+
+    assert network.s.calls == 1
+
+
+@pytest.mark.parametrize("text, expected_code", [
+    ("https://pan.baidu.com/s/1first 解压密码：9999 提取码：abcd", "abcd"),
+    ("https://pan.baidu.com/s/1first 解压密码：9999 提取: abcd", "abcd"),
+    ("https://pan.baidu.com/s/1first?pwd=abcd 提取码：efgh 解压密码：9999", "abcd"),
+    ("https://pan.baidu.com/s/1first 解压密码：9999", ""),
+    ("https://pan.baidu.com/s/1first abcd 解压密码：9999", "abcd"),
+    ("https://pan.baidu.com/s/1first 提取码：12345 解压密码：9999", ""),
+    ("https://pan.baidu.com/share/init?surl=first&pwd=abcd 解压密码：9999", "abcd"),
+])
+def test_passcode_priority_survives_normalization(text, expected_code):
+    assert parse_url_and_code(normalize_link(text))[1] == expected_code
+
+
+@pytest.mark.parametrize("suffix, expected_code", [
+    ("提取码：abcd", "abcd"),
+    ("，提取码：abcd", "abcd"),
+    ("。提取码:abcd", "abcd"),
+    ("提取码： abcd", "abcd"),
+    (" 提取码：[abcd]", "abcd"),
+    (" 提取码：（abcd）", "abcd"),
+    (" 提取码：( abcd )", "abcd"),
+    (" 提取码：【abcd】", "abcd"),
+    (" 提取码abcd", "abcd"),
+    (" 提取码[abcd]", "abcd"),
+    (" abcd 解压密码与提取码不同", "abcd"),
+    ("提取:abcd 解压密码：9999", "abcd"),
+    (" 提取码：[12345] 解压密码：9999", ""),
+    (" 提取码：[abc] 解压密码：9999", ""),
+    (" 提取码：[] 解压密码：9999", ""),
+    ("解压密码：9999", ""),
+    ("解压密码：9999 提取码：[abcd]", "abcd"),
+    ("?pwd=efgh，提取码：[abcd] 解压密码：9999", "efgh"),
+    ("?pwd=efgh。解压密码：9999", "efgh"),
+])
+@pytest.mark.parametrize("share_path", ["/s/1first", "/share/init?surl=first"])
+def test_share_url_and_labeled_code_are_separated_without_whitespace(share_path, suffix, expected_code):
+    raw = f"https://pan.baidu.com{share_path}{suffix}"
+    expected = ("https://pan.baidu.com/s/1first", expected_code)
+
+    assert parse_url_and_code(raw) == expected
+    assert parse_url_and_code(normalize_link(raw)) == expected
+
+
+@pytest.mark.parametrize("scheme", ["http", "HTTP", "hTtPs"])
+def test_attached_passcode_uses_raw_offsets_before_http_upgrade(scheme):
+    raw = f"链接：{scheme}://pan.baidu.com/s/1first提取码：[abcd] 解压密码：9999"
+    expected = ("https://pan.baidu.com/s/1first", "abcd")
+
+    assert parse_url_and_code(raw) == expected
+    assert parse_url_and_code(normalize_link(raw)) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "https://example.invalid/x提取码：abcd https://pan.baidu.com/s/1first",
+    "https://pan.baidu.com.example.invalid/x，提取码：abcd",
+    "https://pan.baidu.com提取码：abcd/x",
+    "https://pan.baidu.com，example.invalid/s/1first 提取码：abcd",
+    "https://pan.baidu.com提取码：abcd@example.invalid/x",
+])
+def test_labeled_code_splitting_does_not_relax_first_url_origin_validation(raw):
+    assert parse_url_and_code(raw) == ("", "")
+    assert parse_url_and_code(normalize_link(raw)) == ("", "")
 
 
 def test_parse_response_rejects_mismatched_file_fields():
@@ -371,6 +531,111 @@ def test_get_dir_list_reads_all_pages():
     assert network.s.requests[1]["params"]["page"] == "2"
 
 
+@pytest.mark.parametrize("invalid_item", [
+    None, {}, [], "corrupt", 1,
+    {"server_filename": "file"}, {"isdir": 0},
+    {"server_filename": "", "isdir": 0},
+    {"server_filename": "file", "isdir": True},
+    {"server_filename": "file", "isdir": 2},
+    {"fs_id": True}, {"fs_id": -1}, {"fs_id": 1.5}, {"fs_id": "invalid"},
+    {"fs_id": "", "server_filename": "file", "isdir": 0},
+])
+def test_directory_response_retries_malformed_identity_without_filtering_items(monkeypatch, invalid_item):
+    network = Network()
+    valid_item = {"fs_id": 900, "server_filename": "file", "isdir": 0}
+    network.s = FakeSession([
+        FakeResponse(0, {"errno": 0, "list": [valid_item, invalid_item]}),
+        FakeResponse(0, {"errno": 0, "list": [valid_item]}),
+    ])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    assert network.get_dir_list("/target") == [valid_item]
+    assert network.s.calls == 2
+    assert [call["params"]["page"] for call in network.s.requests] == ["1", "1"]
+
+
+@pytest.mark.parametrize("invalid_item", [{}, None])
+def test_malformed_directory_page_exhaustion_never_returns_partial_items(monkeypatch, invalid_item):
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(0, {"errno": 0, "list": [{"fs_id": 900}], "has_more": 1}),
+        *[FakeResponse(0, {"errno": 0, "list": [{"fs_id": 901}, invalid_item]}) for _ in range(5)],
+    ])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(ValueError, match="目录列表"):
+        network.get_dir_list("/target")
+
+    assert network.s.calls == 6
+    assert [call["params"]["page"] for call in network.s.requests] == ["1", "2", "2", "2", "2", "2"]
+
+
+@pytest.mark.parametrize("item", [
+    {"fs_id": 900}, {"fs_id": "900"},
+    {"server_filename": "file", "isdir": 0},
+    {"server_filename": "folder", "isdir": "1", "fs_id": None},
+])
+def test_directory_identity_does_not_require_content_metadata(item):
+    network = Network()
+    network.s = FakeSession([FakeResponse(0, {"errno": 0, "list": [item]})])
+
+    assert network.get_dir_list("/target") == [item]
+    assert network.s.calls == 1
+
+
+@pytest.mark.parametrize("method, arguments, payload, content", [
+    ("get_bdstoken", (), {"errno": 0, "result": {"bdstoken": "token"}}, b""),
+    ("get_dir_list", ("/target",), {"errno": 0, "list": []}, b""),
+    ("create_dir", ("target",), {"errno": 0}, b""),
+    ("verify_pass_code", ("https://pan.baidu.com/s/1first", "abcd"), {"errno": 0, "randsk": "dummy"}, b""),
+    ("get_transfer_params", ("https://pan.baidu.com/s/1first",), {"errno": 0},
+     b'{"shareid":123,"share_uk":"456","fs_id":789,"server_filename":"file","isdir":0}'),
+    ("transfer_file", (["123", "456", ["789"], ["file"], ["0"]], "target"), {"errno": 0}, b""),
+    ("create_share", (789, 0, "abcd"), {"errno": 0, "link": "https://pan.baidu.com/s/1first"}, b""),
+    ("create_dir_compat", ("target",), {"errno": 0}, b""),
+])
+def test_every_network_endpoint_enables_tls_certificate_verification(method, arguments, payload, content):
+    network = Network()
+    network.s = FakeSession([FakeResponse(0, payload, content)])
+
+    if method == "create_dir_compat":
+        Network.create_dir.__wrapped__(network, *arguments)
+    else:
+        getattr(network, method)(*arguments)
+
+    assert network.s.calls == 1
+    assert network.s.requests[0]["verify"] is True
+
+
+@pytest.mark.parametrize("method, arguments", [
+    ("get_bdstoken", ()),
+    ("get_transfer_params", ("https://pan.baidu.com/s/1first",)),
+    ("create_dir", ("target",)),
+])
+def test_certificate_errors_never_retry_with_verification_disabled(monkeypatch, method, arguments):
+    network = Network()
+    network.s = FakeSession([requests.exceptions.SSLError("certificate verify failed")] * 5)
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    if method == "create_dir":
+        assert network.create_dir(*arguments) == UNKNOWN_RESULT
+    else:
+        with pytest.raises(requests.exceptions.SSLError):
+            getattr(network, method)(*arguments)
+
+    assert network.s.calls == 5
+    assert all(call["verify"] is True for call in network.s.requests)
+
+
+def test_network_does_not_globally_suppress_tls_warnings(monkeypatch):
+    calls = []
+    monkeypatch.setattr("requests.packages.urllib3.disable_warnings", lambda: calls.append(True))
+    network = Network()
+
+    assert calls == []
+    network.s.close()
+
+
 def test_pagination_deduplicates_overlapping_items_and_uses_unique_total():
     first = [{"fs_id": index} for index in range(1000)]
     network = Network()
@@ -426,6 +691,19 @@ def test_get_dir_list_returns_api_errors_without_reading_the_list(errno, extra):
 
     assert network.get_dir_list("/target") == errno
     assert network.s.calls == 1
+
+
+@pytest.mark.parametrize("partial_page", [False, True])
+def test_get_dir_list_preserves_unknown_result_instead_of_errno_or_partial_items(
+    monkeypatch, partial_page,
+):
+    network = Network()
+    responses = ([{"errno": 0, "list": [{"fs_id": 1}], "has_more": 1}]
+                 if partial_page else []) + [UNKNOWN_RESULT]
+    payloads = iter(responses)
+    monkeypatch.setattr(network, "_request_json", lambda *_args, **_kwargs: next(payloads))
+
+    assert network.get_dir_list("/target") == UNKNOWN_RESULT
 
 
 @pytest.mark.parametrize("metadata", [{"total": 1}, {"has_more": 1}, {"total": 1, "has_more": True}])

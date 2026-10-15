@@ -5,7 +5,7 @@ import json
 import pytest
 import requests
 
-from src.network import Network, RequestCancelledError, UNKNOWN_RESULT
+from src.network import Network, ParsedTransferPage, RequestCancelledError, UNKNOWN_RESULT
 from src.operations import CancellationRequested, Operations, PrefetchState
 from src.utils import TransferParams
 
@@ -89,6 +89,300 @@ def test_setup_save_keeps_duplicate_input_rows_aligned():
 
     assert len(operation.link_list) == 2
     assert len(operation.link_list_org) == 2
+
+
+@pytest.mark.parametrize("row", [
+    "https://example.invalid/x https://pan.baidu.com/s/1first",
+    "https://example.invalid/?next=https://pan.baidu.com/s/1first",
+])
+def test_invalid_first_url_is_rejected_by_main_worker_and_prefetch(monkeypatch, row):
+    operation = make_operation(row)
+    calls = []
+    operation.verify_link = lambda *_args: calls.append("verify") or VALID_RESULT
+    operation.network.transfer_file = lambda *_args: calls.append("transfer") or 0
+    operation.network.bdstoken = "token"
+    monkeypatch.setattr("src.operations.thread_it", lambda *_args: calls.append("prefetch"))
+
+    operation.schedule_prefetch(0)
+    operation.handle_process_save()
+
+    assert calls == []
+    assert operation.valid_link_count == 0
+    assert operation.prefetch_states == {}
+
+
+@pytest.mark.parametrize("custom_mode", [True, False])
+@pytest.mark.parametrize("change", [
+    "file_id", "name", "size", "md5", "missing_metadata", "owner", "share_id", "isdir", "added_file",
+])
+def test_resume_blocks_changed_source_without_discarding_unknown_checkpoint(custom_mode, change):
+    from copy import deepcopy
+
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.root.var_custom_mode.value = custom_mode
+    original = deepcopy(VERIFIABLE_RESULT)
+    operation.verify_link = lambda *_args: original
+    transferred = []
+    results = iter([UNKNOWN_RESULT, 0])
+    operation.network.transfer_file = (
+        lambda params, path, **_kwargs: transferred.append((params[2][:], path)) or next(results)
+    )
+    operation.save()
+    changed = deepcopy(original)
+    if change == "file_id":
+        changed[2] = ["790"]
+    elif change == "name":
+        changed[3] = ["new.zip"]
+    elif change == "owner":
+        changed[1] = "999"
+    elif change == "share_id":
+        changed[0] = "999"
+    elif change == "isdir":
+        changed[4] = ["1"]
+    elif change == "added_file":
+        changed[2].append("790")
+        changed[3].append("extra.zip")
+        changed[4].append("0")
+        changed.item_metadata.append({"size": 200, "md5": "b" * 32})
+    elif change == "missing_metadata":
+        changed.item_metadata = []
+    else:
+        changed.item_metadata[0][change] = 200 if change == "size" else "b" * 32
+    operation.verify_link = lambda *_args: changed
+
+    operation.save(resume=True)
+
+    assert len(transferred) == 1
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+    assert operation.unknown_transfer_states[0].params == original
+    assert operation.unknown_transfer_states[0].params.item_metadata == original.item_metadata
+    assert "分享内容已变化" in operation.root.text_logs.value
+    assert "转存成功" not in operation.root.text_logs.value
+
+    operation.verify_link = lambda *_args: original
+    operation.save(resume=True)
+    assert len(transferred) == 2
+    assert operation.next_task_index == 1
+    assert operation.unknown_transfer_tasks == set()
+
+
+@pytest.mark.parametrize("custom_mode", [True, False])
+def test_resume_allows_reordered_source_with_equivalent_metadata(custom_mode):
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.root.var_custom_mode.value = custom_mode
+    original = TransferParams(
+        ["123", "456", ["789", "790"], ["first.zip", "second.zip"], ["0", "0"]],
+        [{"size": 100, "md5": FILE_MD5}, {"size": 200, "md5": "b" * 32}],
+    )
+    reordered = TransferParams(
+        ["123", "456", ["790", "789"], ["second.zip", "first.zip"], ["0", "0"]],
+        [{"size": "200", "md5": "B" * 32}, {"size": "100", "md5": FILE_MD5.upper()}],
+    )
+    operation.verify_link = lambda *_args: original
+    transferred = []
+    results = iter([UNKNOWN_RESULT, 0])
+    operation.network.transfer_file = (
+        lambda params, path, **_kwargs: transferred.append((params[2][:], path)) or next(results)
+    )
+
+    operation.save()
+    assert operation.resume_available is True
+    operation.verify_link = lambda *_args: reordered
+    operation.save(resume=True)
+
+    destination = "target/1" if custom_mode else "target"
+    assert transferred == [(["789", "790"], destination), (["790", "789"], destination)]
+    assert operation.next_task_index == 1
+    assert operation.resume_available is False
+    assert operation.unknown_transfer_states == {}
+    assert "转存成功" in operation.root.text_logs.value
+
+
+@pytest.mark.parametrize("text", [
+    "https://pan.baidu.com/s/1first 解压密码：9999 提取码：abcd",
+    "https://pan.baidu.com/s/1first?pwd=abcd 提取码：efgh 解压密码：9999",
+    "https://pan.baidu.com/s/1first提取码：abcd 解压密码：9999",
+    "https://pan.baidu.com/s/1first，提取码：abcd 解压密码：9999",
+    "https://pan.baidu.com/s/1first 提取码：[abcd] 解压密码：9999",
+    "https://pan.baidu.com/s/1first 提取码：（abcd） 解压密码：9999",
+])
+def test_save_verifies_the_selected_passcode_instead_of_archive_password(text):
+    operation = make_save_operation(text)
+    operation.verify_link = Operations.verify_link.__get__(operation)
+    verified = []
+    operation.network.verify_pass_code = (
+        lambda url, password: verified.append((url, password)) or "verified-cookie"
+    )
+    operation.network.get_transfer_params = lambda _url: ParsedTransferPage("", VALID_RESULT)
+    transferred = []
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: transferred.append(path) or 0
+    )
+
+    operation.save()
+
+    assert verified == [("https://pan.baidu.com/s/1first", "abcd")]
+    assert transferred == ["target/1"]
+    assert operation.next_task_index == 1
+    assert "转存成功" in operation.root.text_logs.value
+
+
+def test_collision_budget_survives_resume_after_unknown_third_directory_creation():
+    operation = make_save_operation(
+        "7. Title\nhttps://pan.baidu.com/s/1first 1234\n"
+        "8. Title\nhttps://pan.baidu.com/s/1second 1234",
+    )
+    created = []
+    paths = []
+    creation = iter([0, 0, UNKNOWN_RESULT, 0, 0, 0, 0])
+
+    def transfer(_params, path, **_kwargs):
+        paths.append(path)
+        return 0 if path == "target/8" else 4
+
+    operation.network.create_dir = lambda path: created.append(path) or next(creation)
+    operation.network.transfer_file = transfer
+    operation.save()
+    assert operation.pending_custom_dirs == {1: "target/7_3"}
+    operation.save(resume=True)
+
+    assert paths == ["target/7", "target/7_2", "target/7_3", "target/8"]
+    assert "target/7_4" not in created
+    assert operation.next_task_index == 4
+    assert operation.resume_available is False
+
+
+def test_new_batch_gets_its_own_collision_budget():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    paths = []
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or 4
+    )
+    operation.save()
+    assert paths == ["target/1", "target/1_2", "target/1_3"]
+    assert operation.resume_available is False
+
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or 0
+    )
+    operation.save()
+
+    assert paths == ["target/1", "target/1_2", "target/1_3", "target/1"]
+    assert operation.next_task_index == 1
+    assert "转存成功" in operation.root.text_logs.value
+
+
+@pytest.mark.parametrize("title", ["51、3D game", "51)3D game", "51）3D game"])
+def test_numbered_titles_allow_numeric_content_after_non_decimal_delimiters(title):
+    operation = make_operation(f"{title}\nhttps://pan.baidu.com/s/1first 1234")
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+
+    operation.handle_process_save()
+
+    assert paths == ["target/51"]
+
+
+@pytest.mark.parametrize("prefix", ["51.[archive]/sub", "51.[backup].zip", "51.[SLG]/v2"])
+def test_explicit_bracketed_directory_paths_are_not_replaced_by_title_numbers(prefix):
+    operation = make_operation(f"{prefix} https://pan.baidu.com/s/1first 1234")
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+
+    operation.handle_process_save()
+
+    assert paths == [f"target/{prefix}"]
+
+
+@pytest.mark.parametrize("prefix, first_directory", [
+    ("7.", "7"), ("7)", "7"), ("[7]", "7"), ("7.[SLG]", "7"),
+    ("文件名", "1"),
+])
+def test_attached_url_is_not_part_of_the_directory_on_collision(prefix, first_directory):
+    operation = make_save_operation(
+        f"{prefix}https://pan.baidu.com/s/1first abcd\n"
+        "8.https://pan.baidu.com/s/1second abcd",
+    )
+    paths = []
+    created = []
+    results = iter([4, 0, 0])
+    operation.network.create_dir = lambda path: created.append(path) or 0
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or next(results)
+    )
+
+    operation.save()
+
+    expected = [f"target/{first_directory}", f"target/{first_directory}_2", "target/8"]
+    assert paths == expected
+    assert created == expected
+    assert operation.next_task_index == 2
+    assert operation.resume_available is False
+    assert operation.root.text_logs.value.count("转存成功") == 2
+
+
+def test_attached_numbered_url_resumes_at_the_same_collision_directory():
+    operation = make_save_operation(
+        "7.HTTPS://pan.baidu.com/s/1first abcd\n"
+        "8.HTTPS://pan.baidu.com/s/1second abcd",
+    )
+    paths = []
+    results = iter([4, UNKNOWN_RESULT, 0, 0])
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or next(results)
+    )
+
+    operation.save()
+
+    assert paths == ["target/7", "target/7_2"]
+    assert operation.pending_custom_dirs == {0: "target/7_2"}
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+
+    operation.save(resume=True)
+
+    assert paths == ["target/7", "target/7_2", "target/7_2", "target/8"]
+    assert operation.next_task_index == 2
+    assert operation.pending_custom_dirs == {}
+    assert operation.unknown_transfer_states == {}
+    assert operation.resume_available is False
+
+
+@pytest.mark.parametrize("scheme", ["HTTPS", "HTTP", "hTtPs"])
+@pytest.mark.parametrize("prefix", ["51.[archive]/sub", "51.[backup].zip"])
+def test_explicit_directory_is_preserved_with_case_insensitive_url_scheme(scheme, prefix):
+    operation = make_save_operation(
+        f"51. Title\n{prefix} {scheme}://pan.baidu.com/s/1first abcd",
+    )
+    paths = []
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or 0
+    )
+
+    operation.save()
+
+    assert paths == [f"target/{prefix}"]
+    assert operation.pending_custom_dirs == {}
+    assert operation.next_task_index == 2
+    assert operation.resume_available is False
+
+
+@pytest.mark.parametrize("custom_mode", [True, False])
+def test_check_mode_does_not_read_or_create_destination(custom_mode):
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.root.var_check_mode.value = True
+    operation.root.var_custom_mode.value = custom_mode
+    calls = []
+    operation.network.get_dir_list = lambda *_args: calls.append("list") or -9
+    operation.network.create_dir = lambda *_args: calls.append("create") or 0
+    operation.network.transfer_file = lambda *_args: calls.append("transfer") or 0
+
+    operation.save()
+
+    assert calls == []
+    assert "链接有效" in operation.root.text_logs.value
+    assert operation.next_task_index == 1
 
 
 def test_placeholder_text_is_not_treated_as_a_real_link():
@@ -292,9 +586,12 @@ def test_unknown_transfer_is_confirmed_by_target_directory_listing():
     operation.network.transfer_file = (
         lambda _params, path, **_kwargs: transfers.append(path) or UNKNOWN_RESULT
     )
-    operation.network.get_dir_list = lambda _path: [
-        {"server_filename": "file", "isdir": 0, "fs_id": "900", "size": "100", "md5": FILE_MD5.upper()},
-    ]
+    listings = iter([
+        [],
+        [{"server_filename": "file", "isdir": 0, "fs_id": "900",
+          "size": "100", "md5": FILE_MD5.upper()}],
+    ])
+    operation.network.get_dir_list = lambda _path: next(listings)
 
     operation.handle_process_save()
 
@@ -310,6 +607,7 @@ def test_unknown_transfer_rechecks_before_sending_a_duplicate_request():
     operation.verify_link = lambda *_args: VERIFIABLE_RESULT
     transfers = []
     listings = iter([
+        [],
         [],
         [{"server_filename": "file", "isdir": 0, "fs_id": "900", "size": 100, "md5": FILE_MD5}],
     ])
@@ -358,9 +656,11 @@ def test_unknown_transfer_cannot_be_confirmed_by_a_name_or_wrong_content(metadat
     operation = make_operation("https://pan.baidu.com/s/1first 1234")
     operation.verify_link = lambda *_args: VERIFIABLE_RESULT
     operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
-    operation.network.get_dir_list = lambda _path: [
-        {"server_filename": "file", "isdir": 0, "fs_id": "900", **metadata},
-    ]
+    listings = iter([
+        [],
+        [{"server_filename": "file", "isdir": 0, "fs_id": "900", **metadata}],
+    ])
+    operation.network.get_dir_list = lambda _path: next(listings)
 
     operation.handle_process_save()
 
@@ -373,9 +673,11 @@ def test_unknown_transfer_target_must_include_an_explicit_file_type():
     operation = make_operation("https://pan.baidu.com/s/1first 1234")
     operation.verify_link = lambda *_args: VERIFIABLE_RESULT
     operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
-    operation.network.get_dir_list = lambda _path: [
-        {"server_filename": "file", "fs_id": 900, "size": 100, "md5": FILE_MD5},
-    ]
+    listings = iter([
+        [],
+        [{"server_filename": "file", "fs_id": 900, "size": 100, "md5": FILE_MD5}],
+    ])
+    operation.network.get_dir_list = lambda _path: next(listings)
 
     operation.handle_process_save()
 
@@ -389,9 +691,12 @@ def test_unknown_transfer_with_insufficient_source_metadata_keeps_checkpoint(isd
     params = TransferParams(["123", "456", ["789"], ["file"], [isdir]])
     operation.verify_link = lambda *_args: params
     operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
-    operation.network.get_dir_list = lambda _path: [
-        {"server_filename": "file", "isdir": int(isdir), "size": 100, "md5": FILE_MD5},
-    ]
+    listings = iter([
+        [],
+        [{"server_filename": "file", "isdir": int(isdir),
+          "size": 100, "md5": FILE_MD5}],
+    ])
+    operation.network.get_dir_list = lambda _path: next(listings)
 
     operation.handle_process_save()
 
@@ -406,9 +711,11 @@ def test_unknown_directory_is_not_confirmed_by_top_level_metadata():
         [{"size": 100, "md5": FILE_MD5}],
     )
     operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
-    operation.network.get_dir_list = lambda _path: [
-        {"server_filename": "file", "isdir": 1, "size": 100, "md5": FILE_MD5},
-    ]
+    listings = iter([
+        [],
+        [{"server_filename": "file", "isdir": 1, "size": 100, "md5": FILE_MD5}],
+    ])
+    operation.network.get_dir_list = lambda _path: next(listings)
 
     operation.handle_process_save()
 
@@ -424,7 +731,8 @@ def test_unknown_transfer_requires_all_expected_files_with_distinct_target_ids()
     )
     operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
     item = {"server_filename": "file", "isdir": 0, "fs_id": 900, "size": 100, "md5": FILE_MD5}
-    operation.network.get_dir_list = lambda _path: [item, dict(item)]
+    listings = iter([[], [item, dict(item)]])
+    operation.network.get_dir_list = lambda _path: next(listings)
 
     operation.handle_process_save()
 
@@ -512,6 +820,122 @@ def test_failed_normal_mode_snapshot_disables_automatic_confirmation(snapshot_re
     assert operation.verify_unknown_transfer(0) is False
     assert operation.next_task_index == 0
     assert not operation.unknown_transfer_states[0].baseline_known
+
+
+@pytest.mark.parametrize("invalid_item", [{}, None])
+def test_malformed_fresh_baseline_cannot_confirm_a_timed_out_transfer(monkeypatch, invalid_item):
+    operation = make_save_operation("https://pan.baidu.com/s/1first abcd")
+    operation.root.var_custom_mode.value = False
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    operation.network.get_dir_list = Network.get_dir_list.__get__(operation.network)
+    operation.network.transfer_file = Network.transfer_file.__get__(operation.network)
+    existing = {"fs_id": 900, "server_filename": "file", "isdir": 0, "size": 100, "md5": FILE_MD5}
+    calls = []
+
+    def listing(**kwargs):
+        calls.append(("list", kwargs["params"]["page"]))
+        list_count = sum(kind == "list" for kind, _ in calls)
+        items = [invalid_item] if list_count > 1 and not any(kind == "transfer" for kind, _ in calls) else [existing]
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"errno": 0, "list": items})
+
+    def transfer(**_kwargs):
+        calls.append(("transfer", None))
+        raise requests.Timeout("No destination mutation; ambiguous response")
+
+    operation.network.s = SimpleNamespace(get=listing, post=transfer, close=lambda: None)
+    monkeypatch.setattr("src.network.random.uniform", lambda *_args: 0)
+
+    operation.save()
+
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+    assert operation.unknown_transfer_tasks == {0}
+    assert operation.unknown_transfer_states[0].baseline_known is False
+    assert operation.destination_baselines["target"] == [existing]
+    assert calls == [("list", "1")] * 6 + [("transfer", None)] * 5
+    assert "转存成功" not in operation.root.text_logs.value
+    assert "已自动核对" not in operation.root.text_logs.value
+
+    # A later valid listing cannot repair the missing pre-write snapshot.
+    operation.verify_link = lambda *_args: -1
+    operation.save(resume=True)
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+    assert operation.unknown_transfer_tasks == {0}
+    assert len(calls) == 11
+
+    confirmed_paths = []
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: confirmed_paths.append(path) or 0
+    )
+    operation.save(resume=True)
+
+    assert confirmed_paths == ["target"]
+    assert operation.next_task_index == 1
+    assert operation.resume_available is False
+    assert operation.unknown_transfer_states == {}
+
+
+@pytest.mark.parametrize("invalid_item", [{}, None, {"server_filename": "file"}])
+def test_malformed_baseline_from_a_replaced_network_method_is_not_trusted(invalid_item):
+    operation = make_operation("https://pan.baidu.com/s/1first abcd")
+    operation.custom_mode = False
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    operation.network.get_dir_list = lambda _path: [invalid_item]
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+    assert operation.unknown_transfer_states[0].baseline_known is False
+
+
+@pytest.mark.parametrize("invalid_item", [{}, None])
+def test_unknown_verification_rejects_a_damaged_stored_baseline(invalid_item):
+    operation = make_operation("https://pan.baidu.com/s/1first abcd")
+    operation.destination_baselines["target/1"] = [invalid_item]
+    operation._remember_unknown_transfer(0, VERIFIABLE_RESULT, "target/1", "url")
+    operation.network.get_dir_list = lambda _path: [
+        {"fs_id": 900, "server_filename": "file", "isdir": 0, "size": 100, "md5": FILE_MD5},
+    ]
+
+    assert operation.verify_unknown_transfer(0) is False
+    assert operation.unknown_transfer_tasks == {0}
+
+
+@pytest.mark.parametrize("invalid_item", [{}, None])
+def test_unknown_verification_never_uses_a_partially_valid_current_listing(invalid_item):
+    operation = make_operation("https://pan.baidu.com/s/1first abcd")
+    operation._remember_unknown_transfer(0, VERIFIABLE_RESULT, "target/1", "url")
+    operation.network.get_dir_list = lambda _path: [
+        {"fs_id": 900, "server_filename": "file", "isdir": 0, "size": 100, "md5": FILE_MD5},
+        invalid_item,
+    ]
+
+    assert operation.verify_unknown_transfer(0) is False
+    assert operation.unknown_transfer_tasks == {0}
+
+
+@pytest.mark.parametrize("baseline", [
+    [{"fs_id": 900}],
+    [{"server_filename": "file", "isdir": 0}],
+    [{"server_filename": "file", "isdir": "0", "fs_id": None}],
+])
+def test_baseline_identity_without_content_metadata_still_reserves_existing_files(baseline):
+    operation = make_operation("https://pan.baidu.com/s/1first abcd")
+    operation.custom_mode = False
+    operation.verify_link = lambda *_args: VERIFIABLE_RESULT
+    existing = {"fs_id": 900, "server_filename": "file", "isdir": 0, "size": 100, "md5": FILE_MD5}
+    listings = iter([baseline, [existing]])
+    operation.network.get_dir_list = lambda _path: next(listings)
+    operation.network.transfer_file = lambda *_args, **_kwargs: UNKNOWN_RESULT
+
+    operation.handle_process_save()
+
+    assert operation.next_task_index == 0
+    assert operation.unknown_transfer_states[0].baseline_known is True
+    assert operation.unknown_transfer_tasks == {0}
 
 
 def test_verified_transfer_parameters_are_cached_across_title_rows():
@@ -835,8 +1259,7 @@ def test_resume_confirms_unknown_directory_creation_before_transferring(confirme
     operation.handle_process_save()
 
     expected = [("create", "target/1"), ("create", "target/1")]
-    if confirmed_creation == -8:
-        expected.append(("list", "/target/1"))
+    expected.append(("list", "/target/1"))
     assert calls == expected + [("transfer", "target/1")]
     assert operation.next_task_index == 1
     assert operation.custom_dir_count == 1
@@ -845,11 +1268,15 @@ def test_resume_confirms_unknown_directory_creation_before_transferring(confirme
 def test_resume_unknown_creation_does_not_transfer_into_a_nonempty_directory():
     operation = make_operation("https://pan.baidu.com/s/1first 1234")
     calls = []
-    results = iter([UNKNOWN_RESULT, -8, 0])
+    results = iter([UNKNOWN_RESULT, -8, 0, 0])
     operation.network.create_dir = (
         lambda path: calls.append(("create", path)) or next(results)
     )
-    operation.network.get_dir_list = lambda *_args: [{"server_filename": "unrelated"}]
+    def list_directory(path):
+        calls.append(("list", path))
+        return [] if path == "/target/1_2" else [{"server_filename": "unrelated"}]
+
+    operation.network.get_dir_list = list_directory
     operation.network.transfer_file = (
         lambda _params, path, **_kwargs: calls.append(("transfer", path)) or 0
     )
@@ -860,7 +1287,9 @@ def test_resume_unknown_creation_does_not_transfer_into_a_nonempty_directory():
 
     assert calls == [
         ("create", "target/1"), ("create", "target/1"),
-        ("create", "target/2"), ("transfer", "target/2"),
+        ("list", "/target/1"), ("create", "target/1"),
+        ("list", "/target/1"), ("create", "target/1_2"),
+        ("list", "/target/1_2"), ("transfer", "target/1_2"),
     ]
     assert operation.next_task_index == 1
 
@@ -871,7 +1300,12 @@ def test_unknown_creation_after_number_collision_preserves_the_allocated_number(
     )
     results = iter([-8, UNKNOWN_RESULT, 0, 0])
     operation.network.create_dir = lambda *_args: next(results)
-    operation.network.get_dir_list = lambda *_args: [{"server_filename": "existing"}]
+    listings = iter([
+        [{"server_filename": "existing"}],
+        [],
+        [],
+    ])
+    operation.network.get_dir_list = lambda *_args: next(listings)
     paths = []
     operation.network.transfer_file = (
         lambda _params, path, **_kwargs: paths.append(path) or 0
@@ -881,8 +1315,8 @@ def test_unknown_creation_after_number_collision_preserves_the_allocated_number(
     operation.change_status('running')
     operation.handle_process_save()
 
-    assert paths == ["target/2", "target/3"]
-    assert operation.custom_dir_count == 3
+    assert paths == ["target/1_2", "target/2"]
+    assert operation.custom_dir_count == 2
 
 
 def test_share_item_exception_does_not_stop_following_items():
@@ -1008,8 +1442,95 @@ def test_duplicate_title_rows_cannot_shift_a_link_to_the_next_title():
 
     operation.handle_process_save()
 
-    assert paths == ["target/1", "target/2", "target/3"]
+    assert paths == ["target/83", "target/83_2", "target/84"]
     assert operation.completed_task_count == 6
+
+
+def test_title_numbers_survive_conflicts_and_missing_entries():
+    operation = make_operation(
+        "7. first title\n"
+        "https://pan.baidu.com/s/1first 1234\n"
+        "8. second title\n"
+        "https://pan.baidu.com/s/1second 1234\n"
+        "50. missing title\n"
+        "缺失百度链接\n"
+        "51. fifty-first title\n"
+        "https://pan.baidu.com/s/1fifty-first 1234"
+    )
+    paths = []
+    transfer_results = iter([4, 0, 0, 0])
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs:
+        paths.append(path) or next(transfer_results)
+    )
+
+    operation.handle_process_save()
+
+    assert paths == ["target/7", "target/7_2", "target/8", "target/51"]
+    assert operation.custom_dir_count == 51
+
+
+def test_created_directory_is_rechecked_before_transfer():
+    operation = make_operation(
+        "7. first title\n"
+        "https://pan.baidu.com/s/1first 1234\n"
+        "8. second title\n"
+        "https://pan.baidu.com/s/1second 1234"
+    )
+    paths = []
+    operation.network.get_dir_list = (
+        lambda path: [{"server_filename": "existing"}]
+        if path == "/target/7" else []
+    )
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or 0
+    )
+
+    operation.handle_process_save()
+
+    assert paths == ["target/7_2", "target/8"]
+
+
+@pytest.mark.parametrize("title", [
+    "51. Title", "51.Title", "51、Title", "51) Title", "[51] Title",
+    "51）Title", "51．Title",
+])
+def test_title_number_formats_bind_to_the_next_link(title):
+    operation = make_operation(f"{title}\nhttps://pan.baidu.com/s/1first 1234")
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+
+    operation.handle_process_save()
+
+    assert paths == ["target/51"]
+
+
+@pytest.mark.parametrize("prefix", ["51.", "51)", "51、", "[51]", "51.[SLG]"])
+def test_numbered_title_on_link_row_uses_the_number(prefix):
+    operation = make_operation(f"{prefix} https://pan.baidu.com/s/1first 1234")
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+
+    operation.handle_process_save()
+
+    assert paths == ["target/51"]
+
+
+@pytest.mark.parametrize("name", ["51.files", "[51]archive", "51", "2026.backup"])
+def test_title_format_support_preserves_explicit_directory_names(name):
+    operation = make_operation(
+        f"50. Title\n{name} https://pan.baidu.com/s/1first 1234",
+    )
+    paths = []
+    operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
+
+    operation.handle_process_save()
+
+    assert paths == [f"target/{name}"]
+
+
+def test_decimal_archive_name_is_not_a_title_number():
+    assert Operations._extract_title_number("51.7z") is None
 
 
 def test_duplicate_custom_links_get_distinct_numbered_directories():
@@ -1047,12 +1568,15 @@ def test_nonempty_existing_directory_is_not_reused():
     )
     paths = []
     operation.network.create_dir = lambda path: -8 if path == "target/1" else 0
-    operation.network.get_dir_list = lambda *_args: [{"server_filename": "existing"}]
+    operation.network.get_dir_list = (
+        lambda path: [{"server_filename": "existing"}]
+        if path == "/target/1" else []
+    )
     operation.network.transfer_file = lambda _params, path, **_kwargs: paths.append(path) or 0
 
     operation.handle_process_save()
 
-    assert paths == ["target/2", "target/3"]
+    assert paths == ["target/1_2", "target/2"]
 
 
 def test_existing_empty_directory_can_be_reused():
@@ -1079,6 +1603,70 @@ def test_directory_listing_login_failure_does_not_trigger_creation():
     assert operation.resume_available is True
 
 
+def test_unknown_base_directory_listing_keeps_checkpoint_without_creating_or_transferring():
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    operation.network.get_dir_list = lambda *_args: UNKNOWN_RESULT
+    calls = []
+    operation.network.create_dir = lambda path: calls.append(("create", path)) or 0
+    operation.network.transfer_file = lambda _params, path: calls.append(("transfer", path)) or 0
+
+    operation.save()
+
+    assert calls == []
+    assert operation.next_task_index == 0
+    assert operation.resume_available is True
+    assert "无法确认目录状态" in operation.root.text_logs.value
+    assert "未预料错误" not in operation.root.text_logs.value
+
+    operation.network.get_dir_list = lambda *_args: []
+    operation.save(resume=True)
+
+    assert calls == [("create", "target/1"), ("transfer", "target/1")]
+    assert operation.next_task_index == 1
+    assert operation.resume_available is False
+
+
+def test_unknown_share_directory_listing_never_starts_an_item_loop():
+    operation = make_save_operation("original input")
+    operation.network.get_dir_list = lambda *_args: UNKNOWN_RESULT
+    shared = []
+    operation.network.create_share = lambda *_args: shared.append(True)
+
+    operation.share(SimpleNamespace(result=("永久", "1234", False)))
+
+    assert shared == []
+    assert operation.root.text_links.value == "original input"
+    assert operation.completed_task_count == 0
+    assert "无法确认目录" in operation.root.text_logs.value
+    assert "未预料错误" not in operation.root.text_logs.value
+    assert "分享时发生" not in operation.root.text_logs.value
+
+
+def test_base_directory_read_timeout_retains_checkpoint_and_reports_retryable_error(monkeypatch):
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    del operation.network.get_dir_list
+    reads = []
+    writes = []
+
+    def get(**kwargs):
+        reads.append(kwargs["params"]["dir"])
+        raise requests.Timeout("directory read timeout")
+
+    operation.network.s = SimpleNamespace(get=get, close=lambda: None)
+    operation.network.create_dir = lambda path: writes.append(path) or 0
+    operation.network.transfer_file = lambda _params, path: writes.append(path) or 0
+    monkeypatch.setattr("src.network.random.uniform", lambda *_args: 0)
+
+    operation.save()
+
+    assert reads == ["/target"] * 5
+    assert writes == []
+    assert operation.resume_available is True
+    assert operation.next_task_index == 0
+    assert "保留断点" in operation.root.text_logs.value
+    assert "未预料错误" not in operation.root.text_logs.value
+
+
 def test_save_creates_a_missing_base_directory_from_the_real_list_api_response():
     operation = Operations(make_root("https://pan.baidu.com/s/1first 1234"))
     operation.network.get_bdstoken = lambda: "token"
@@ -1087,7 +1675,12 @@ def test_save_creates_a_missing_base_directory_from_the_real_list_api_response()
 
     def get(**kwargs):
         calls.append(("list", kwargs["params"]["dir"]))
-        return SimpleNamespace(json=lambda: {"errno": -9}, raise_for_status=lambda: None)
+        payload = (
+            {"errno": -9}
+            if kwargs["params"]["dir"] == "/target"
+            else {"errno": 0, "list": []}
+        )
+        return SimpleNamespace(json=lambda: payload, raise_for_status=lambda: None)
 
     def post(**kwargs):
         action = "create" if kwargs["url"].endswith("/api/create") else "transfer"
@@ -1102,7 +1695,8 @@ def test_save_creates_a_missing_base_directory_from_the_real_list_api_response()
 
     assert calls == [
         ("list", "/target"), ("create", "/target"),
-        ("create", "/target/1"), ("transfer", "/target/1"),
+        ("create", "/target/1"), ("list", "/target/1"),
+        ("transfer", "/target/1"),
     ]
     assert operation.next_task_index == 1
     assert operation.resume_available is False
@@ -1132,9 +1726,97 @@ def test_collision_retries_in_a_new_empty_directory():
     operation.network.transfer_file = transfer
     operation.handle_process_save()
 
-    assert paths == ["target/1", "target/2"]
-    assert "target/2" in operation.root.text_logs.value
+    assert paths == ["target/1", "target/1_2"]
+    assert "target/1_2" in operation.root.text_logs.value
     assert operation.completed_task_count == 1
+
+
+@pytest.mark.parametrize("third_result", [0, 4])
+def test_repeated_directory_races_are_bounded_and_preserve_the_next_number(third_result):
+    operation = make_operation(
+        "7. Title\nhttps://pan.baidu.com/s/1first 1234\n"
+        "8. Title\nhttps://pan.baidu.com/s/1second 1234",
+    )
+    paths = []
+    occupied = set()
+    results = iter([4, -8, third_result, 0])
+    operation.network.get_dir_list = (
+        lambda path: [{"server_filename": "other-client"}]
+        if path.lstrip("/") in occupied else []
+    )
+
+    def transfer(_params, path, **_kwargs):
+        paths.append(path)
+        result = next(results)
+        if result in (-8, 4):
+            occupied.add(path)
+        return result
+
+    operation.network.transfer_file = transfer
+    operation.handle_process_save()
+
+    assert paths == ["target/7", "target/7_2", "target/7_3", "target/8"]
+    assert operation.custom_dir_count == 8
+    assert operation.next_task_index == 4
+    assert operation.root.text_logs.value.count("改用新的空目录重试") == 2
+    assert operation.root.text_logs.value.count("转存成功") == (2 if third_result == 0 else 1)
+
+
+def test_collision_retry_unknown_result_retains_the_suffix_directory_on_resume():
+    operation = make_operation(
+        "7. Title\nhttps://pan.baidu.com/s/1first 1234\n"
+        "8. Title\nhttps://pan.baidu.com/s/1second 1234",
+    )
+    paths = []
+    results = iter([4, UNKNOWN_RESULT, 4, 0, 0])
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or next(results)
+    )
+
+    operation.handle_process_save()
+    assert paths == ["target/7", "target/7_2"]
+    assert operation.pending_custom_dirs == {1: "target/7_2"}
+    assert operation.unknown_transfer_tasks == {1}
+
+    operation.change_status('running')
+    operation.handle_process_save()
+    assert paths == ["target/7", "target/7_2", "target/7_2"]
+    assert operation.next_task_index == 1
+
+    operation.change_status('running')
+    operation.handle_process_save()
+    assert paths == ["target/7", "target/7_2", "target/7_2", "target/7_2", "target/8"]
+    assert operation.pending_custom_dirs == {}
+    assert operation.unknown_transfer_tasks == set()
+
+
+def test_third_collision_directory_unknown_creation_resumes_at_the_same_suffix():
+    operation = make_operation(
+        "7. Title\nhttps://pan.baidu.com/s/1first 1234\n"
+        "8. Title\nhttps://pan.baidu.com/s/1second 1234",
+    )
+    created = []
+    paths = []
+    create_results = iter([0, 0, UNKNOWN_RESULT, 0, 0])
+    transfer_results = iter([4, -8, 0, 0])
+    operation.network.create_dir = lambda path: created.append(path) or next(create_results)
+    operation.network.transfer_file = (
+        lambda _params, path, **_kwargs: paths.append(path) or next(transfer_results)
+    )
+
+    operation.handle_process_save()
+
+    assert paths == ["target/7", "target/7_2"]
+    assert operation.next_task_index == 1
+    assert operation.pending_custom_dirs == {1: "target/7_3"}
+
+    operation.change_status('running')
+    operation.handle_process_save()
+
+    assert created == ["target/7", "target/7_2", "target/7_3", "target/7_3", "target/8"]
+    assert paths == ["target/7", "target/7_2", "target/7_3", "target/8"]
+    assert operation.custom_dir_count == 8
+    assert operation.next_task_index == 4
 
 
 def test_directory_creation_error_is_isolated_to_one_item():
@@ -1199,7 +1881,7 @@ def test_custom_transfer_uses_one_create_request_without_list_or_sleep(monkeypat
 
     operation.handle_process_save()
 
-    assert calls == [("create", "target/1")]
+    assert calls == [("create", "target/1"), ("list", "/target/1")]
 
 
 def test_null_passcode_result_is_rejected_before_updating_cookie():
@@ -1334,6 +2016,8 @@ def test_temporary_api_exhaustion_retains_current_item_at_every_stage(monkeypatc
 
     operation.verify_link = lambda *_args: VALID_RESULT
     operation.network.create_dir = lambda *_args: 0
+    if stage == "list":
+        operation.network.get_dir_list = lambda *_args: []
     operation.change_status('running')
     operation.handle_process_save()
 
@@ -1470,7 +2154,7 @@ def test_save_runs_all_network_stages_with_titles_duplicates_and_retry(monkeypat
 
     assert operation.completed_task_count == 4
     assert transfer_attempts == 3
-    assert sum(url.endswith("/api/list") for _method, url in requests) == 1
+    assert sum(url.endswith("/api/list") for _method, url in requests) == 3
     assert sum(url.endswith("/api/create") for _method, url in requests) == 2
     assert root.text_logs.value.count("转存成功") == 2
     assert "未预料错误" not in root.text_logs.value
