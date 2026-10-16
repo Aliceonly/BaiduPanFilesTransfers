@@ -660,8 +660,9 @@ class Operations:
                 result = f'分享结果未知：{msg}'
             elif isinstance(r, str):
                 share_link = f'{r}?pwd={password}'
-                self.share_results.append(share_link)
-                result = f'分享成功：{share_link} {msg}'
+                share_result = f'{share_link} {msg}'
+                self.share_results.append(share_result)
+                result = f'分享成功：{share_result}'
             else:
                 result = f'分享失败：错误代码（{r}） {msg}'
             self.insert_logs(result)

@@ -456,11 +456,13 @@ def test_copy_share_results_contains_only_successful_links_in_order(monkeypatch,
     operation.copy_share_results()
 
     expected = [
-        f"https://pan.baidu.com/s/1first?pwd={passwords[0]}",
-        f"https://pan.baidu.com/s/1last?pwd={passwords[3]}",
+        f"https://pan.baidu.com/s/1first?pwd={passwords[0]} 文件：item-0",
+        f"https://pan.baidu.com/s/1last?pwd={passwords[3]} 目录：item-3/",
     ]
     assert operation.share_results == expected
     assert clipboard == ["\n".join(expected)]
+    for share_result in expected:
+        assert f"分享成功：{share_result}" in operation.root.text_logs.value
     assert passwords == (["abcd", "2345", "efgh", "6789"] if random_password else ["1234"] * 4)
     assert operation.root.button_copy_share.options["state"] == "normal"
     assert operation.root.label_status.options["text"] == "已复制 2 条分享结果"
@@ -510,7 +512,7 @@ def test_starting_another_task_clears_old_share_results(task):
         operation.network.create_share = lambda *_args: response
         operation.share(SimpleNamespace(result=("永久", "1234", False)))
 
-    expected = ["https://pan.baidu.com/s/1new?pwd=1234"] if task == "successful_share" else []
+    expected = ["https://pan.baidu.com/s/1new?pwd=1234 文件：file"] if task == "successful_share" else []
     assert operation.share_results == expected
     assert operation.root.button_copy_share.options["state"] == ("normal" if expected else "disabled")
 
