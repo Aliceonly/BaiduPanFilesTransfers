@@ -7,7 +7,7 @@
 """
 # 程序基本信息
 MAIN_TITLE = 'BaiduPanFilesTransfers'
-MAIN_VERSION = '2.8.8'
+MAIN_VERSION = '2.8.9'
 HOME_PAGE = 'https://github.com/hxz393/BaiduPanFilesTransfers'
 # noinspection LongLine
 # 图标使用 zlib 压缩后，再用 base64 编码的值
@@ -92,6 +92,7 @@ http://pan.baidu.com/s/1_evfkiTrEZvOkC2hb-NiKw ju9a
     'save': '批量转存',
     'share': '批量分享',
     'copy_share': '复制分享结果',
+    'reset_progress': '重置进度',
     'trust': '系统代理',
     'trust_tip': '应用系统代理访问百度网盘',
     'custom': '指定目录',

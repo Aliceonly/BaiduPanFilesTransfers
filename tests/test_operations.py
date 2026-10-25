@@ -67,11 +67,14 @@ def make_root(raw_links):
         bottom_share=DummyWidget(),
         bottom_save=DummyWidget(),
         button_copy_share=DummyWidget(),
+        button_reset_progress=DummyWidget(),
     )
 
 
 def make_operation(raw_links):
     operation = Operations(make_root(raw_links))
+    operation.PREFETCH_WORKERS = 0
+    operation.network.probe_directory = lambda path, **_kwargs: operation.network.get_dir_list(path)
     operation.network.get_dir_list = lambda *_args: []
     operation.network.create_dir = lambda *_args: 0
     operation.network.transfer_file = lambda *_args, **_kwargs: 0
@@ -95,13 +98,13 @@ def test_setup_save_keeps_duplicate_input_rows_aligned():
     "https://example.invalid/x https://pan.baidu.com/s/1first",
     "https://example.invalid/?next=https://pan.baidu.com/s/1first",
 ])
-def test_invalid_first_url_is_rejected_by_main_worker_and_prefetch(monkeypatch, row):
+def test_invalid_first_url_is_rejected_by_main_worker_and_prefetch(row):
     operation = make_operation(row)
+    operation.PREFETCH_WORKERS = 2
     calls = []
     operation.verify_link = lambda *_args: calls.append("verify") or VALID_RESULT
     operation.network.transfer_file = lambda *_args: calls.append("transfer") or 0
     operation.network.bdstoken = "token"
-    monkeypatch.setattr("src.operations.thread_it", lambda *_args: calls.append("prefetch"))
 
     operation.schedule_prefetch(0)
     operation.handle_process_save()
@@ -1021,20 +1024,25 @@ def test_resuming_refreshes_cached_share_authentication_and_metadata(replace_coo
     assert len(verified) == 2
 
 
-def test_no_password_pages_are_prefetched_with_an_isolated_session(monkeypatch):
+def test_pages_are_prefetched_with_an_isolated_session(monkeypatch):
     operation = make_operation(
         "https://pan.baidu.com/s/no-password\n"
         "https://pan.baidu.com/s/with-password 1234"
     )
     operation.network.bdstoken = "token"
+    operation.PREFETCH_WORKERS = 1
     created = []
 
     class ReadNetwork:
         def __init__(self):
             self.headers = {}
             self.bdstoken = ""
-            self.s = SimpleNamespace(trust_env=False, close=lambda: None)
+            self.s = SimpleNamespace(trust_env=False, close=lambda: None,
+                                     cookies=SimpleNamespace(clear=lambda: None))
             created.append(self)
+
+        def verify_pass_code(self, *_args, **_kwargs):
+            return "prefetched-password"
 
         def get_transfer_params(self, _url, on_retry=None, cancel_event=None):
             return json.dumps({
@@ -1046,10 +1054,6 @@ def test_no_password_pages_are_prefetched_with_an_isolated_session(monkeypatch):
             })
 
     monkeypatch.setattr("src.operations.Network", ReadNetwork)
-    monkeypatch.setattr(
-        "src.operations.thread_it",
-        lambda func, *args: func(*args),
-    )
     operation.verify_link = lambda *_args: pytest.fail(
         "prefetched result should be consumed"
     )
@@ -1061,15 +1065,16 @@ def test_no_password_pages_are_prefetched_with_an_isolated_session(monkeypatch):
 
     assert result == VALID_RESULT
     assert len(created) == 1
+    operation._cancel_prefetch()
 
 
 @pytest.mark.parametrize("resume", [False, True])
 def test_prefetch_cancellation_stops_old_worker_retries_even_after_resume(monkeypatch, resume):
     operation = make_operation("https://pan.baidu.com/s/no-password")
     operation.network.bdstoken = "token"
+    operation.PREFETCH_WORKERS = 1
     started = threading.Event()
     released = threading.Event()
-    threads = []
     requests_sent = []
     closed = []
 
@@ -1077,7 +1082,8 @@ def test_prefetch_cancellation_stops_old_worker_retries_even_after_resume(monkey
         def __init__(self):
             super().__init__()
             self.s.close()
-            self.s = SimpleNamespace(trust_env=False, get=self.get, close=self.close)
+            self.s = SimpleNamespace(trust_env=False, get=self.get, close=self.close,
+                                     cookies=SimpleNamespace(clear=lambda: None))
 
         def get(self, **_kwargs):
             requests_sent.append(True)
@@ -1089,15 +1095,9 @@ def test_prefetch_cancellation_stops_old_worker_retries_even_after_resume(monkey
             closed.append(True)
             released.set()
 
-    def run_thread(func, *args):
-        thread = threading.Thread(target=func, args=args, daemon=True)
-        threads.append(thread)
-        thread.start()
-        return thread
-
     monkeypatch.setattr("src.operations.Network", PrefetchNetwork)
-    monkeypatch.setattr("src.operations.thread_it", run_thread)
     operation.schedule_prefetch(0)
+    threads = operation._prefetch_pool.threads
     state = next(iter(operation.prefetch_states.values()))
     assert started.wait(2)
 
@@ -1120,7 +1120,7 @@ def test_prefetch_cancellation_stops_old_worker_retries_even_after_resume(monkey
 
 def test_resume_discards_completed_prefetch_from_previous_cookie():
     operation = make_operation("https://pan.baidu.com/s/no-password")
-    state = PrefetchState(event=threading.Event(), cookie_generation=operation.cookie_generation)
+    state = PrefetchState(event=threading.Event(), batch_generation=operation.batch_generation)
     state.result = VALID_RESULT
     state.event.set()
     operation.prefetch_states[("https://pan.baidu.com/s/no-password", "")] = state
@@ -1138,7 +1138,7 @@ def test_resume_discards_completed_prefetch_from_previous_cookie():
 
 def test_invalid_prefetched_share_result_is_not_cached():
     operation = make_operation("https://pan.baidu.com/s/no-password")
-    state = PrefetchState(event=threading.Event(), cookie_generation=operation.cookie_generation)
+    state = PrefetchState(event=threading.Event(), batch_generation=operation.batch_generation)
     state.result = -6
     state.event.set()
     operation.prefetch_states[("https://pan.baidu.com/s/no-password", "")] = state
@@ -2110,6 +2110,7 @@ def test_save_runs_all_network_stages_with_titles_duplicates_and_retry(monkeypat
         "https://pan.baidu.com/s/1same 1234"
     )
     operation = Operations(root)
+    operation.PREFETCH_WORKERS = 0
     requests = []
     transfer_attempts = 0
     closed = []
@@ -2179,6 +2180,8 @@ def test_slashes_in_the_base_directory_do_not_change_allocated_paths():
 
 def make_save_operation(raw_links):
     operation = Operations(make_root(raw_links))
+    operation.PREFETCH_WORKERS = 0
+    operation.network.probe_directory = lambda path, **_kwargs: operation.network.get_dir_list(path)
     operation.network.get_bdstoken = lambda: "token"
     operation.network.get_dir_list = lambda *_args: []
     operation.network.create_dir = lambda *_args: 0
@@ -2378,6 +2381,199 @@ def test_new_batch_resets_the_checkpoint_after_completion():
     assert operation.next_task_index == operation.completed_task_count == 1
     assert operation.custom_dir_count == 1
     assert operation.root.text_logs.value.count("转存成功") == 1
+
+
+@pytest.mark.parametrize("batch", ["idle", "completed", "interrupted", "shared"])
+def test_reset_progress_clears_the_batch_and_preserves_inputs_and_logs(batch):
+    operation = make_save_operation(
+        "https://pan.baidu.com/s/1first 1234\n"
+        "https://pan.baidu.com/s/1second 1234"
+    )
+    if batch == "interrupted":
+        interrupt_before_second_item(operation)
+    if batch in ("completed", "interrupted"):
+        operation.save()
+    elif batch == "shared":
+        operation.network.get_dir_list = lambda *_args: [
+            {"isdir": 0, "server_filename": "file", "fs_id": 1},
+        ]
+        operation.network.create_share = lambda *_args: "https://pan.baidu.com/s/1shared"
+        operation.share(SimpleNamespace(result=("永久", "1234", False)))
+    logs = operation.root.text_logs.value
+    session = operation.network.s
+    prefetch = PrefetchState(event=threading.Event(), batch_generation=0)
+    operation.prefetch_states[("old", "")] = prefetch
+    operation.transfer_params_cache[("old", "")] = VALID_RESULT
+
+    operation.reset_progress()
+
+    assert operation.next_task_index == operation.completed_task_count == 0
+    assert operation.total_task_count == operation.valid_link_count == 0
+    assert operation.link_list == operation.link_list_org == operation.share_results == []
+    assert operation.custom_dir_count == 0
+    assert operation.created_dirs == operation.used_custom_dirs == operation.saved_links == set()
+    assert operation.pending_custom_dirs == operation.unknown_transfer_states == {}
+    assert operation.prefetch_states == operation.transfer_params_cache == {}
+    assert prefetch.cancel_event.is_set()
+    assert operation.resume_available is operation.running is operation._reset_pending is False
+    assert not operation.cancel_event.is_set()
+    assert operation.worker_thread is operation._ui_snapshot is None
+    assert operation.network.s is not session
+    assert operation.root.text_links.value == ""
+    assert operation.root.text_links.is_placeholder is False
+    assert operation.root.text_logs.value == logs
+    assert operation.root.entry_cookie.value == "BAIDUID=test"
+    assert operation.root.entry_folder_name.value == "target"
+    assert operation.root.var_custom_mode.value is True
+    assert operation.root.var_check_mode.value is operation.root.var_trust_env.value is False
+    assert operation.root.label_status.options["text"] == "总进度：0/0"
+    assert operation.root.bottom_save.options["text"] == "批量转存"
+    assert operation.root.bottom_save.options["command"] == operation.start_save
+    assert operation.root.bottom_share.options["command"] == operation.start_share
+    assert operation.root.bottom_save.options["state"] == "normal"
+    assert operation.root.bottom_share.options["state"] == "normal"
+    assert operation.root.button_reset_progress.options["state"] == "normal"
+    assert operation.root.button_copy_share.options["state"] == "disabled"
+
+
+@pytest.mark.parametrize("task", ["save", "share"])
+def test_reset_progress_allows_a_new_batch_instead_of_resuming(monkeypatch, task):
+    operation = make_save_operation(
+        "https://pan.baidu.com/s/1first 1234\n"
+        "https://pan.baidu.com/s/1second 1234"
+    )
+    interrupt_before_second_item(operation)
+    operation.save()
+    assert operation.resume_available is True
+    operation.reset_progress()
+    operation.root.text_links.value = "https://pan.baidu.com/s/1new 1234"
+    monkeypatch.setattr("src.operations.thread_it", lambda func, *args: func(*args))
+    if task == "save":
+        paths = []
+        operation.network.transfer_file = lambda _params, path: paths.append(path) or 0
+        operation.root.bottom_save.options["command"]()
+        assert paths == ["target/1"]
+        assert operation.link_list_org == ["https://pan.baidu.com/s/1new 1234"]
+    else:
+        monkeypatch.setattr(
+            "src.operations.CustomDialog",
+            lambda _root: SimpleNamespace(result=("永久", "1234", False)),
+        )
+        operation.network.get_dir_list = lambda *_args: [
+            {"isdir": 0, "server_filename": "file", "fs_id": 1},
+        ]
+        operation.network.create_share = lambda *_args: "https://pan.baidu.com/s/1new"
+        operation.root.bottom_share.options["command"]()
+        assert operation.share_results == ["https://pan.baidu.com/s/1new?pwd=1234 文件：file"]
+    assert operation.completed_task_count == operation.total_task_count == 1
+    assert operation.resume_available is False
+
+
+@pytest.mark.parametrize("task", ["save", "share"])
+def test_reset_progress_waits_for_the_worker_without_allowing_another_start(monkeypatch, task):
+    operation = make_save_operation("https://pan.baidu.com/s/1first 1234")
+    callbacks = []
+    operation.root.after = lambda delay, callback: callbacks.append((delay, callback))
+    started = threading.Event()
+    release = threading.Event()
+
+    def get_token():
+        started.set()
+        assert release.wait(5)
+        return "token"
+
+    operation.network.get_bdstoken = get_token
+    if task == "save":
+        operation.start_save()
+    else:
+        monkeypatch.setattr(
+            "src.operations.CustomDialog",
+            lambda _root: SimpleNamespace(result=("永久", "1234", False)),
+        )
+        operation.start_share()
+    worker = operation.worker_thread
+    try:
+        assert started.wait(2)
+        operation.reset_progress()
+        assert operation._reset_pending is True
+        assert operation.cancel_event.is_set()
+        assert operation.root.bottom_save.options["state"] == "disabled"
+        assert operation.root.bottom_share.options["state"] == "disabled"
+        assert operation.root.button_reset_progress.options["state"] == "disabled"
+        assert operation.root.text_links.value != ""
+        pending_callbacks = len(callbacks)
+        operation.reset_progress()
+        operation.start_save()
+        operation.start_share()
+        assert operation.worker_thread is worker
+        assert len(callbacks) == pending_callbacks
+    finally:
+        release.set()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    for _delay, callback in callbacks:
+        callback()
+    assert operation._reset_pending is operation.resume_available is False
+    assert operation.root.text_links.value == ""
+    assert operation.root.label_status.options["text"] == "总进度：0/0"
+    assert operation.root.bottom_save.options["state"] == "normal"
+    assert operation.root.bottom_share.options["state"] == "normal"
+
+
+def test_reset_progress_discards_queued_updates_from_the_previous_batch():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    callbacks = []
+    operation.root.after = lambda _delay, callback: callbacks.append(callback)
+
+    def queue_updates():
+        operation.change_status("interrupted")
+        operation.insert_logs("old file", alt=True)
+
+    worker = threading.Thread(target=queue_updates)
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert len(callbacks) == 2
+
+    operation.reset_progress()
+    for callback in callbacks:
+        callback()
+
+    assert operation.root.text_links.value == ""
+    assert operation.root.label_status.options["text"] == "总进度：0/0"
+    assert operation.root.bottom_save.options["text"] == "批量转存"
+    assert operation.root.bottom_share.options["state"] == "normal"
+
+
+def test_reset_progress_wakes_a_paused_save_worker():
+    operation = make_operation("https://pan.baidu.com/s/1first 1234")
+    operation.change_status("paused")
+    cancelled = []
+    started = threading.Event()
+    callbacks = []
+    operation.root.after = lambda _delay, callback: callbacks.append(callback)
+
+    def paused_worker():
+        started.set()
+        try:
+            operation.pause_detection(operation.link_list[0])
+        except CancellationRequested:
+            cancelled.append(True)
+
+    worker = threading.Thread(target=paused_worker)
+    operation.worker_thread = worker
+    worker.start()
+    assert started.wait(2)
+    operation.reset_progress()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    for callback in callbacks:
+        callback()
+
+    assert cancelled == [True]
+    assert operation.root.text_links.value == ""
+    assert operation.root.bottom_save.options["text"] == "批量转存"
+    assert operation.running is False
 
 
 def test_resume_without_a_pending_batch_does_not_start_a_new_transfer():
@@ -2665,8 +2861,8 @@ def test_validated_share_page_is_not_parsed_again_by_operations(monkeypatch, pre
         lambda *_args, **_kwargs: SimpleNamespace(content=page.encode()),
     )
     if prefetch:
+        operation.PREFETCH_WORKERS = 1
         operation.network.bdstoken = "token"
-        monkeypatch.setattr("src.operations.thread_it", lambda func, *args: func(*args))
         operation.schedule_prefetch(0)
 
     result = operation.get_cached_transfer_params(operation.link_list[0])
@@ -2674,3 +2870,4 @@ def test_validated_share_page_is_not_parsed_again_by_operations(monkeypatch, pre
     assert result == VERIFIABLE_RESULT
     assert result.item_metadata == [{"size": 100, "md5": FILE_MD5}]
     assert parsed == [True]
+    operation._cancel_prefetch()

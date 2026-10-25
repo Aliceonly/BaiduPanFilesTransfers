@@ -29,6 +29,21 @@ def test_copy_button_does_not_require_operations_during_window_initialization():
     MainWindow._copy_button_click(SimpleNamespace(op=None))
 
 
+def test_reset_button_invokes_the_operations_callback():
+    calls = []
+    root = SimpleNamespace(
+        op=SimpleNamespace(reset_progress=lambda: calls.append(True)),
+    )
+
+    MainWindow._reset_button_click(root)
+
+    assert calls == [True]
+
+
+def test_reset_button_does_not_require_operations_during_window_initialization():
+    MainWindow._reset_button_click(SimpleNamespace(op=None))
+
+
 @pytest.mark.parametrize("value", ["real links", "placeholder"])
 def test_focus_in_resets_a_stale_placeholder_flag(value):
     deleted = []

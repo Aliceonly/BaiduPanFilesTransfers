@@ -14,7 +14,7 @@ import time
 import traceback
 from copy import deepcopy
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Union, List, Dict, Any, Tuple, Optional
 
 import requests
@@ -23,6 +23,8 @@ from src.constants import EXP_MAP, DELAY_SECONDS, INVALID_CHARS, ERROR_CODES, SA
 from src.network import (
     Network, ParsedTransferPage, RequestCancelledError, RetryExhaustedError, UNKNOWN_RESULT,
 )
+from src.metrics import RequestMetrics
+from src.prefetch import PrefetchPool, PrefetchState
 from src.ui import CustomDialog
 from src.utils import (
     thread_it,
@@ -69,18 +71,6 @@ class UnknownTransferState:
     baseline_known: bool = True
 
 
-@dataclass
-class PrefetchState:
-    """保存后台预取的分享页面结果，主 worker 只负责按顺序消费。"""
-
-    event: threading.Event
-    cookie_generation: int
-    cancel_event: threading.Event = field(default_factory=threading.Event)
-    network: Optional[Network] = None
-    result: Union[List[Any], int, None] = None
-    error: Exception = None
-
-
 class Operations:
     """
     包括主功能实现流程，涉及部分对 UI 的操作。
@@ -89,12 +79,33 @@ class Operations:
     :param root: 主窗口
     """
 
-    PREFETCH_WORKERS = 3
+    PREFETCH_WORKERS = 2
     CUSTOM_TRANSFER_ATTEMPTS = 3
 
     def __init__(self, root):
         self.root = root
         self.network = Network()
+        self._clear_batch_state()
+        self.transfer_params_cache: Dict[Tuple[str, str], CachedShare] = {}
+        self.prefetch_states: Dict[Tuple[str, str], PrefetchState] = {}
+        self.batch_generation = 0
+        self._prefetch_pool = None
+        self.metrics = RequestMetrics()
+        self.network.metrics = self.metrics
+        self._run_started = None
+        self.running = False
+        self._run_lock = threading.Lock()
+        self._prefetch_lock = threading.Lock()
+        self._ui_thread = threading.current_thread()
+        self._ui_generation = 0
+        self._reset_pending = False
+        self.cancel_event = threading.Event()
+        self.worker_thread = None
+        self.batch_cookie = ''
+        self._ui_snapshot = None
+
+    def _clear_batch_state(self) -> None:
+        """清除本轮任务、断点和结果，不改动用户配置。"""
         self.custom_dir_count = 0
         self.created_dirs = set()
         self.used_custom_dirs = set()
@@ -105,9 +116,6 @@ class Operations:
         self.unknown_transfer_tasks = set()
         self.unknown_transfer_states: Dict[int, UnknownTransferState] = {}
         self.destination_baselines: Dict[str, List[Dict[str, Any]]] = {}
-        self.transfer_params_cache: Dict[Tuple[str, str], CachedShare] = {}
-        self.prefetch_states: Dict[Tuple[str, str], PrefetchState] = {}
-        self.cookie_generation = 0
         self.saved_links = set()
         self.share_results: List[str] = []
         self.link_list = []
@@ -115,19 +123,12 @@ class Operations:
         self.next_task_index = 0
         self.completed_task_count = 0
         self.total_task_count = 0
+        self.valid_link_count = 0
         self.resume_available = False
-        self.running = False
-        self._run_lock = threading.Lock()
-        self._prefetch_lock = threading.Lock()
-        self._ui_thread = threading.current_thread()
-        self.cancel_event = threading.Event()
-        self.worker_thread = None
-        self.batch_cookie = ''
-        self._ui_snapshot = None
 
     def start_save(self, resume: bool = False) -> None:
         """从 UI thread 启动转存 worker。"""
-        if self.worker_thread and self.worker_thread.is_alive():
+        if self._reset_pending or self.is_worker_alive():
             return
         self.cancel_event.clear()
         self._ui_snapshot = self._capture_ui_snapshot()
@@ -135,7 +136,7 @@ class Operations:
 
     def start_share(self) -> None:
         """在 UI thread 创建设置对话框，再启动分享 worker。"""
-        if self.worker_thread and self.worker_thread.is_alive():
+        if self._reset_pending or self.is_worker_alive():
             return
         if self.resume_available:
             return
@@ -146,6 +147,46 @@ class Operations:
 
     def is_worker_alive(self) -> bool:
         return bool(self.worker_thread and self.worker_thread.is_alive())
+
+    def reset_progress(self) -> None:
+        """取消当前批次，等待 worker 退出后再清理状态。"""
+        if self._reset_pending:
+            return
+        self._reset_pending = True
+        self._ui_generation += 1
+        self.request_cancel()
+        self._apply_status('resetting')
+        self._finish_reset()
+
+    def _finish_reset(self) -> None:
+        if getattr(self.root, '_closing', False):
+            return
+        if self.is_worker_alive():
+            self.root.after(50, self._finish_reset)
+            return
+        self._clear_batch_state()
+        with self._prefetch_lock:
+            self.prefetch_states.clear()
+        self.transfer_params_cache.clear()
+        self.batch_generation += 1
+        self.metrics = RequestMetrics()
+        self.network.metrics = self.metrics
+        self._run_started = None
+        self.network.reset_session()
+        self.worker_thread = None
+        self._ui_snapshot = None
+        self.batch_cookie = ''
+        self.cancel_event.clear()
+        self._ui_generation += 1
+        self._reset_pending = False
+        self.root.text_links.delete('1.0', 'end')
+        self.root.text_links.is_placeholder = False
+        self.root.text_links.config(fg=COLOR_MAP['text'])
+        self.root.label_status.config(font=('', 10), cursor='arrow')
+        self.root.label_status.unbind('<Button-1>')
+        self.change_status('stopped')
+        self.change_status('progress')
+        self.root.button_reset_progress.config(state='normal')
 
     def copy_share_results(self) -> None:
         """复制本轮成功生成的分享链接，避免把 retry 或失败日志混入结果。"""
@@ -180,7 +221,12 @@ class Operations:
     def _cancel_prefetch(self) -> None:
         """Cancel each worker independently so a resume cannot revive old retries."""
         with self._prefetch_lock:
+            pool = self._prefetch_pool
+            self._prefetch_pool = None
             states = list(self.prefetch_states.values())
+        if pool is not None:
+            pool.cancel()
+        with self._prefetch_lock:
             for state in states:
                 state.cancel_event.set()
         for state in states:
@@ -192,6 +238,9 @@ class Operations:
 
     def _ui_call(self, callback, *args) -> None:
         """把 Tk 操作切回创建窗口的 UI thread。"""
+        generation = self._ui_generation
+        if self._reset_pending:
+            return
         if threading.current_thread() is self._ui_thread:
             callback(*args)
             return
@@ -201,6 +250,9 @@ class Operations:
             return
 
         def invoke_on_ui():
+            # Ignore callbacks queued by a batch that has since been reset.
+            if self._reset_pending or generation != self._ui_generation:
+                return
             try:
                 callback(*args)
             except Exception:
@@ -311,6 +363,7 @@ class Operations:
                 try:
                     self.network.s.close()
                 finally:
+                    self._log_performance()
                     self.change_status('interrupted' if self.resume_available else 'stopped')
             finally:
                 self._run_lock.release()
@@ -357,6 +410,7 @@ class Operations:
                 try:
                     self.network.s.close()
                 finally:
+                    self._log_performance()
                     self.change_status('stopped')
             finally:
                 self._run_lock.release()
@@ -367,7 +421,10 @@ class Operations:
         with self._prefetch_lock:
             self.prefetch_states.clear()
         self.transfer_params_cache.clear()
-        self.cookie_generation += 1
+        self.batch_generation += 1
+        self.metrics = RequestMetrics()
+        self.network.metrics = self.metrics
+        self._run_started = time.perf_counter()
         # Cookie 输入框只去除外层空白，Cookie 内部的分隔符和值不能被改写。
         user_cookie = self._input_value(
             'cookie', lambda: self.root.entry_cookie.get()
@@ -392,23 +449,7 @@ class Operations:
             self.check_mode = self._input_value(
                 'check_mode', lambda: self.root.var_check_mode.get()
             )
-            self.completed_task_count = 0
-            self.custom_dir_count = 0
-            self.created_dirs = set()
-            self.used_custom_dirs = set()
-            self.pending_custom_dirs = {}
-            self.custom_directory_numbers = {}
-            self.custom_transfer_paths = {}
-            self.directory_number_hints = {}
-            self.unknown_transfer_tasks = set()
-            self.unknown_transfer_states = {}
-            self.destination_baselines = {}
-            self.saved_links = set()
-            self.share_results = []
-            self.link_list = []
-            self.link_list_org = []
-            self.next_task_index = 0
-            self.resume_available = False
+            self._clear_batch_state()
         self.network.s.trust_env = self._input_value(
             'trust_env', lambda: self.root.var_trust_env.get()
         )
@@ -419,6 +460,28 @@ class Operations:
             self.network.headers['Cookie'] = self.cookie
         self.change_status('resuming' if resume else 'init')
         write_config(f'{self.cookie}\n{self.folder_name}')
+
+    def _log_performance(self) -> None:
+        """输出本次运行的汇总，不记录凭据或逐请求 URL。"""
+        snapshot = self.metrics.snapshot()
+        if not snapshot['requests'] or self._run_started is None:
+            return
+        elapsed = time.perf_counter() - self._run_started
+        names = {
+            'token': '登录参数', 'verify': '提取码', 'page': '分享页',
+            'list': '目录读取', 'create': '目录创建',
+            'transfer': '转存', 'share': '分享',
+        }
+        stages = '；'.join(
+            f"{names.get(stage, stage)} {value['requests']} 次/{value['seconds']:.2f}s"
+            for stage, value in sorted(snapshot['stages'].items())
+        )
+        self.insert_logs(
+            f"本次运行统计（截至此刻）：耗时 {elapsed:.2f}s（含暂停），"
+            f"HTTP 已结束请求 {snapshot['requests']} 次，"
+            f"重试等待累计 {snapshot['retry_wait_seconds']:.2f}s。"
+            f"各请求累计耗时（并行部分不可相加为总耗时）：{stages}"
+        )
 
     def setup_save(self) -> None:
         """准备链接，更新状态"""
@@ -566,7 +629,11 @@ class Operations:
             elif return_code not in (-8, 4):
                 raise PermanentTaskError(f'创建目录失败，错误代码：{return_code}')
 
-        result = self._network_call(self.network.get_dir_list, f'/{folder_name}')
+        probe_only = require_empty or self.custom_mode
+        read_directory = (
+            self.network.probe_directory if probe_only else self.network.get_dir_list
+        )
+        result = self._network_call(read_directory, f'/{folder_name}')
         if result == UNKNOWN_RESULT:
             raise RetryableTaskError(f'无法确认目录状态：{folder_name}')
         if require_empty:
@@ -585,9 +652,8 @@ class Operations:
                 raise PermanentTaskError(f'创建目录失败，错误代码：{return_code}')
         elif not isinstance(result, list):
             raise RetryableTaskError(f'无法检查目录 {folder_name}，请求返回：{result}')
-        if not require_empty:
-            # Keep one snapshot for lazy verification of an ambiguous transfer.
-            # It avoids an extra list request for every normal-mode transfer.
+        if not probe_only:
+            # Only a complete listing can serve as a reconciliation baseline.
             self.destination_baselines[folder_name] = list(result) if isinstance(result, list) else []
         self.created_dirs.add(folder_name)
         return True
@@ -685,7 +751,12 @@ class Operations:
     # noinspection PyArgumentList
     def _apply_status(self, status: str) -> None:
         """运行状态变化更新函数"""
-        if status == 'init':
+        if status == 'resetting':
+            self.root.label_status.config(text='正在重置，等待当前任务结束…', bootstyle='warning')
+            self.root.bottom_share.config(state='disabled')
+            self.root.bottom_save.config(state='disabled')
+            self.root.button_reset_progress.config(state='disabled')
+        elif status == 'init':
             self.root.label_status.config(text='准备就绪！', font=('', 10), bootstyle='primary', cursor="arrow")
             self.root.label_status.unbind("<Button-1>")
             self.root.text_logs.config(fg=COLOR_MAP['text'])
@@ -797,23 +868,27 @@ class Operations:
             return -1
         cache_key = (url, password)
         prefetch = self.prefetch_states.get(cache_key)
+        if prefetch is not None and prefetch.batch_generation != self.batch_generation:
+            prefetch.cancel_event.set()
+            self.prefetch_states.pop(cache_key, None)
+            prefetch = None
         if prefetch is not None:
             while not prefetch.event.wait(DELAY_SECONDS):
                 self._check_cancelled()
             self._check_cancelled()
             with self._prefetch_lock:
                 self.prefetch_states.pop(cache_key, None)
-            if prefetch.cookie_generation != self.cookie_generation:
-                # A password verification changed BDCLND while this page was
-                # being fetched. Retry it with the current main Session.
-                return self.get_cached_transfer_params(url_code)
             if prefetch.error is not None:
+                if isinstance(prefetch.error, RequestCancelledError):
+                    raise CancellationRequested() from prefetch.error
                 raise RetryableTaskError(
                     f'获取分享页面请求失败：{prefetch.error}'
                 ) from prefetch.error
             if not is_valid_transfer_params(prefetch.result):
                 return prefetch.result
-            self.transfer_params_cache[cache_key] = CachedShare(prefetch.result)
+            self.transfer_params_cache[cache_key] = CachedShare(
+                prefetch.result, prefetch.bdclnd,
+            )
         if cache_key not in self.transfer_params_cache:
             result = self.verify_link(url, password)
             if not is_valid_transfer_params(result):
@@ -832,69 +907,38 @@ class Operations:
             restored = update_cookie(cached.bdclnd, cookie)
             if restored != cookie:
                 self.network.headers['Cookie'] = restored
-                self.cookie_generation += 1
         return cached.params
 
     def schedule_prefetch(self, start_index: int) -> None:
-        """后台预取后续无提取码链接，主 worker 仍按输入顺序转存。"""
-        if not self.network.bdstoken or self.cancel_event.is_set():
+        """用有界、隔离认证的读线程预取，写入仍按输入顺序执行。"""
+        if (not self.network.bdstoken or self.cancel_event.is_set()
+                or self.PREFETCH_WORKERS <= 0):
             return
 
-        pending_count = sum(
-            not state.event.is_set() for state in self.prefetch_states.values()
-        )
-        if pending_count >= self.PREFETCH_WORKERS:
-            return
-
-        scan_end = min(len(self.link_list), start_index + self.PREFETCH_WORKERS * 2)
-        for index in range(start_index, scan_end):
-            if pending_count >= self.PREFETCH_WORKERS:
+        # Bound queued and completed-but-unconsumed work, not just active reads.
+        for index in range(start_index, len(self.link_list)):
+            if len(self.prefetch_states) >= self.PREFETCH_WORKERS * 2:
                 break
             url, password = parse_url_and_code(self.link_list[index])
-            if password or not url:
+            if not url:
                 continue
             cache_key = (url, password)
             if cache_key in self.transfer_params_cache or cache_key in self.prefetch_states:
                 continue
             state = PrefetchState(
                 event=threading.Event(),
-                cookie_generation=self.cookie_generation,
+                batch_generation=self.batch_generation,
             )
             with self._prefetch_lock:
                 if self.cancel_event.is_set():
                     return
+                if self._prefetch_pool is None:
+                    self._prefetch_pool = PrefetchPool(
+                        self.PREFETCH_WORKERS, self.network, self._retry_log,
+                        network_factory=Network,
+                    )
                 self.prefetch_states[cache_key] = state
-            thread_it(self._prefetch_transfer_params, url, state)
-            pending_count += 1
-
-    def _prefetch_transfer_params(self, url: str, state: PrefetchState) -> None:
-        """用独立 Session 预取无提取码分享页，避免并发操作主 Session。"""
-        network = None
-        try:
-            with self._prefetch_lock:
-                if state.cancel_event.is_set() or self.cancel_event.is_set():
-                    raise CancellationRequested()
-                network = Network()
-                state.network = network
-                network.headers = self.network.headers.copy()
-                network.bdstoken = self.network.bdstoken
-                network.s.trust_env = self.network.s.trust_env
-            response = network.get_transfer_params(
-                url,
-                on_retry=self._retry_log,
-                cancel_event=state.cancel_event,
-            )
-            if state.cancel_event.is_set():
-                raise CancellationRequested()
-            state.result = self._share_page_params(response)
-        except Exception as error:
-            state.error = error
-        finally:
-            try:
-                if network is not None:
-                    network.s.close()
-            finally:
-                state.event.set()
+                self._prefetch_pool.submit(url, password, state)
 
     def verify_link(self, url: str, password: str) -> Union[List[Any], int]:
         """验证链接有效性，验证通过返回转存所需参数列表"""
@@ -918,7 +962,6 @@ class Operations:
 
             # 更新 bdclnd 到 cookie
             self.network.headers['Cookie'] = update_cookie(bdclnd, self.network.headers['Cookie'])
-            self.cookie_generation += 1
 
         # 直接访问没有提取码的链接，或更新 bdclnd 后再次访问，获取转存必须的 3 个参数
         try:

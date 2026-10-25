@@ -15,6 +15,7 @@ from urllib.parse import urljoin
 import requests
 
 from src.constants import HEADERS, BASE_URL
+from src.metrics import RequestMetrics
 from src.utils import (
     is_baidu_url, is_permanent_share_error, is_valid_directory_list,
     is_valid_transfer_params, parse_response,
@@ -67,6 +68,7 @@ class Network:
         self.s = requests.Session()
         self.headers = HEADERS.copy()
         self.bdstoken = ''
+        self.metrics: Optional[RequestMetrics] = None
 
     def reset_session(self) -> None:
         """恢复中断批次时重建 Session，保留 headers 中的运行时 Cookie。"""
@@ -89,10 +91,27 @@ class Network:
             raise RequestCancelledError()
 
     def _wait_before_retry(self, cancel_event: Optional[threading.Event]) -> None:
-        if cancel_event is None:
-            self._sleep_before_retry()
-        elif cancel_event.wait(random.uniform(1, 2)):
-            raise RequestCancelledError()
+        metrics = self.metrics
+        started = time.perf_counter() if metrics is not None else None
+        try:
+            if cancel_event is None:
+                self._sleep_before_retry()
+            elif cancel_event.wait(random.uniform(1, 2)):
+                raise RequestCancelledError()
+        finally:
+            if metrics is not None:
+                metrics.record_retry_wait(time.perf_counter() - started)
+
+    def _request(self, stage: str, request: Callable[..., Any], **kwargs) -> Any:
+        """Time only the Session call; parsing, validation and backoff stay outside."""
+        metrics = self.metrics
+        if metrics is None:
+            return request(**kwargs)
+        started = time.perf_counter()
+        try:
+            return request(**kwargs)
+        finally:
+            metrics.record_request(stage, time.perf_counter() - started)
 
     def _request_json(
         self,
@@ -219,7 +238,8 @@ class Network:
                 raise ValueError('bdstoken response 无效')
 
         payload = self._request_json(
-            lambda: self.s.get(
+            lambda: self._request(
+                'token', self.s.get,
                 url=url, params=params, headers=self.headers, timeout=10,
                 allow_redirects=False, verify=True,
             ),
@@ -242,6 +262,25 @@ class Network:
         cancel_event: Optional[threading.Event] = None,
     ) -> Union[List[Any], int, str]:
         """获取目录的完整列表，自动请求所有 pagination pages。"""
+        return self._read_directory(folder_name, on_retry, cancel_event)
+
+    def probe_directory(
+        self,
+        folder_name: str,
+        on_retry: RetryCallback = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Union[List[Any], int, str]:
+        """Return one valid nonempty page or proven empty; never use as a baseline."""
+        return self._read_directory(folder_name, on_retry, cancel_event, probe=True)
+
+    def _read_directory(
+        self,
+        folder_name: str,
+        on_retry: RetryCallback = None,
+        cancel_event: Optional[threading.Event] = None,
+        *,
+        probe: bool = False,
+    ) -> Union[List[Any], int, str]:
         url = f'{BASE_URL}/api/list'
         page_size = 1000
         all_items = []
@@ -293,9 +332,23 @@ class Network:
                         raise ValueError(f'目录 pagination 没有新增内容但仍标记有后续数据：{page}')
                 elif needs_next_page(payload, len(all_items)):
                     raise ValueError(f'目录 pagination 返回空页面但仍标记有后续数据：{page}')
+                elif probe:
+                    # Unknown or malformed metadata is not evidence of emptiness.
+                    def is_zero_or_absent(value):
+                        return value is None or (type(value) in (int, str) and str(value) == '0')
+
+                    if (
+                        not is_zero_or_absent(payload.get('total'))
+                        or not (
+                            payload.get('has_more') is False
+                            or is_zero_or_absent(payload.get('has_more'))
+                        )
+                    ):
+                        raise ValueError('目录 pagination 空页面缺少可信的结束标记')
 
             payload = self._request_json(
-                lambda params=params: self.s.get(
+                lambda params=params: self._request(
+                    'list', self.s.get,
                     url=url, params=params, headers=self.headers, timeout=15,
                     allow_redirects=False, verify=True,
                 ),
@@ -312,6 +365,8 @@ class Network:
                 return payload['errno']
 
             current = payload['list']
+            if probe and current:
+                return current
             if current:
                 seen_pages.add(json.dumps(current, sort_keys=True))
             for item in current:
@@ -349,7 +404,8 @@ class Network:
                 raise ValueError(f'创建目录返回的路径与请求不一致：{created_path}')
 
         payload = self._request_json(
-            lambda: self.s.post(
+            lambda: self._request(
+                'create', self.s.post,
                 url=url, params=params, headers=self.headers, data=data, timeout=15,
                 allow_redirects=False, verify=True,
             ),
@@ -388,7 +444,8 @@ class Network:
                 raise ValueError('提取码 response 缺少 randsk')
 
         payload = self._request_json(
-            lambda: self.s.post(
+            lambda: self._request(
+                'verify', self.s.post,
                 url=url, params=params, headers=self.headers, data=data, timeout=10,
                 allow_redirects=False, verify=True,
             ),
@@ -427,7 +484,8 @@ class Network:
                 self._check_cancelled(cancel_event)
                 if not is_baidu_url(target):
                     raise UnsafeShareUrlError('拒绝向非百度网盘 HTTPS 地址发送 Cookie')
-                response = self.s.get(
+                response = self._request(
+                    'page', self.s.get,
                     url=target, headers=self.headers, timeout=15,
                     verify=True, allow_redirects=False,
                 )
@@ -483,7 +541,8 @@ class Network:
             'path': f'/{folder_name.strip("/")}',
         }
         payload = self._request_json(
-            lambda: self.s.post(
+            lambda: self._request(
+                'transfer', self.s.post,
                 url=url, params=params, headers=self.headers, data=data,
                 timeout=30, allow_redirects=False, verify=True,
             ),
@@ -528,7 +587,8 @@ class Network:
                 raise ValueError('分享 response 缺少 link')
 
         payload = self._request_json(
-            lambda: self.s.post(
+            lambda: self._request(
+                'share', self.s.post,
                 url=url, params=params, headers=self.headers, data=data, timeout=15,
                 allow_redirects=False, verify=True,
             ),
@@ -556,7 +616,8 @@ def _create_dir_once(network: Network, folder_name: str) -> int:
         'block_list': '[]',
         'rtype': '0',
     }
-    response = network.s.post(
+    response = network._request(
+        'create', network.s.post,
         url=url, params=params, headers=network.headers, data=data, timeout=15,
         allow_redirects=False, verify=True,
     )
