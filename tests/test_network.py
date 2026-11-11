@@ -4,7 +4,7 @@ import threading
 import pytest
 import requests
 
-from src.network import Network, ParsedTransferPage, RequestCancelledError, UNKNOWN_RESULT
+from src.network import Network, ParsedTransferPage, RequestCancelledError, RetryExhaustedError, UNKNOWN_RESULT
 from src.utils import normalize_link, parse_response, parse_url_and_code
 
 
@@ -56,6 +56,66 @@ def test_transfer_file_retries_nonzero_errno(monkeypatch):
 
     assert result == 0
     assert network.s.calls == 2
+
+
+def test_create_share_retries_errno_two_with_the_same_parameters(monkeypatch):
+    network = Network()
+    network.s = FakeSession([
+        FakeResponse(2),
+        FakeResponse(0, {"errno": 0, "link": "https://pan.baidu.com/s/1shared"}),
+    ])
+    waits = []
+    retries = []
+    monkeypatch.setattr("src.network.time.sleep", waits.append)
+
+    result = network.create_share(
+        99, 0, "abcd", on_retry=lambda *args: retries.append(args),
+    )
+
+    assert result == "https://pan.baidu.com/s/1shared"
+    assert network.s.calls == 2
+    assert network.s.requests[0] == network.s.requests[1]
+    assert retries == [(2, 2)]
+    assert len(waits) == 1
+
+
+def test_create_share_errno_two_exhaustion_is_retryable(monkeypatch):
+    network = Network()
+    network.s = FakeSession([FakeResponse(2) for _attempt in range(5)])
+    monkeypatch.setattr("src.network.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(RetryExhaustedError, match="临时 API 错误（2）"):
+        network.create_share(99, 0, "abcd")
+
+    assert network.s.calls == 5
+
+
+def test_create_share_errno_two_retry_can_be_cancelled():
+    cancel_event = threading.Event()
+    network = Network()
+    network.s = FakeSession([FakeResponse(2)])
+
+    with pytest.raises(RequestCancelledError):
+        network.create_share(
+            99, 0, "abcd", cancel_event=cancel_event,
+            on_retry=lambda *_args: cancel_event.set(),
+        )
+
+    assert network.s.calls == 1
+
+
+@pytest.mark.parametrize("operation", ["create", "transfer"])
+def test_errno_two_remains_non_retryable_for_transfer_and_create(operation):
+    network = Network()
+    network.s = FakeSession([FakeResponse(2)])
+
+    if operation == "create":
+        result = network.create_dir("target")
+    else:
+        result = network.transfer_file(["123", "456", ["789"], ["file"], ["0"]], "target")
+
+    assert result == 2
+    assert network.s.calls == 1
 
 
 @pytest.mark.parametrize("url", [

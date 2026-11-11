@@ -7,8 +7,7 @@
 """
 # 程序基本信息
 MAIN_TITLE = 'BaiduPanFilesTransfers'
-MAIN_VERSION = '2.8.9'
-HOME_PAGE = 'https://github.com/hxz393/BaiduPanFilesTransfers'
+MAIN_VERSION = '2.8.10'
 # noinspection LongLine
 # 图标使用 zlib 压缩后，再用 base64 编码的值
 ICON_BASE64 = 'eJwBGATn+4lQTkcNChoKAAAADUlIRFIAAAAQAAAAEAgGAAAAH/P/YQAAAAFzUkdCAdnJLH8AAAAEZ0FNQQAAsY8L/GEFAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAAGYktHRAAfAKAA/HaAWHsAAAAJcEhZcwAACxMAAAsTAQCanBgAAAAHdElNRQfpCRQHHh2d/AfQAAADXElEQVQ4y1WTb0jcdRzHX9/v73e3+6venTpLO/W0lLPdbGwSa+vPEmkhDRtbksRYYwiRzAdFDxoYiw3WgxICKQrCYC1aFBsFITltWysRI7PB4d/Tze3wmnr+Oe/83e/37cE4qTd84M0H3k/eb16C/+gZ0D1ud62p1CHgeSCEEAKlYkqpASHE5Y1UauwXyOYyImde8PvzVDrdLuANqWnBinBY7m5qwuPzER0aYqS/X6VTqXkBn2k228c/JpNLABrAS4GA10yn3xfwtm63Fza2tYnjZ87g8nrRdZ0Dra14/X4RHRrKy5rmU8o0i2rc7hsTmUxa6wI5K2W7gHeklM7njh7l8KlTfNvdzdfnz/PrlSvMT07S0tHBXDRKfGZGU0I8jmWlSg3jN82ZlxcSltUNlIQiEU6cPcvlnh76L17E2NxEWRaJ27cJ7dhBZV0dw319KMvSgWqH3d4npWE0AlU2u53mkyeJ3brF4KVLWKa5VW7WMPhzcJCq+nry/f7c+xFLqRclQuyXoD8cClHb0EBfby+b6+tIwOlyUVxWhreggPj0NE6XC19xMeJB+xKlntZ1tKBAEd69h/XlZeZGx9CRlNY8xqun36UyEuH+3btcvfAVylJ48wvQc+MJGZQOqZkOqVMdiRAfn8RaXceXl8+xri4eCpbT1/MJ92NzHO7sxOnxYBca27ZOmrpbaJNS6s/6i7aTmInhUJJQbR3l4TBfvNnJ+M3fGfH76LjQS34ggLm0gkvoACilJqVL2AfcQssIw8Tt9uCRdoqLS8gkV0mOT+MWOiK5TmJiCmNjA5th4RE23ELPOjVbv+6y6YMyy1+L0Yk9NU0HKCzwk00sss3poLS8kvmlNXzBMirqd+JwuTly7j1Gv/8BI5OJLsbjP2k3N1bWDjoCy1Yq3RhpbXGuxe6QGB7FXxFkV9sRSqpDPPn6a5DN0n/6HIHycna2NK/seuXlrn0njl3TAA5lCqcy2bVU+t5CQ+begnPjTpyFkVEwshQ9WkVyfIrhDz8l8cffxH6+lowNXP/ANFY/D+7da2zB9A1he8JvNQvEWyieEALHg6UkylIopTIKxixlfeTJT393fHY2/T8ac3R+uT1SlDHMfSi1HyFCAiWUEDFliRuWlr3e/k80LkDlAv8CzpZY93GkF0QAAAAASUVORK5CYIJMc+Fb%'
@@ -96,10 +95,9 @@ http://pan.baidu.com/s/1_evfkiTrEZvOkC2hb-NiKw ju9a
     'trust': '系统代理',
     'trust_tip': '应用系统代理访问百度网盘',
     'custom': '指定目录',
-    'custom_tip': '每个链接资源保存在单独文件夹中',
+    'custom_tip': '仅批量转存：每个链接资源保存在单独文件夹中',
     'check': '检测模式',
     'check_tip': '检查链接是否有效但不转存',
-    'help': '使用帮助',
     'settings_title': '设置分享选项',
     'expiry_title': '设置分享期限：',
     'password_title': '自定义提取码：',

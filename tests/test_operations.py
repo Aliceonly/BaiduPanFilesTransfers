@@ -5,7 +5,7 @@ import json
 import pytest
 import requests
 
-from src.network import Network, ParsedTransferPage, RequestCancelledError, UNKNOWN_RESULT
+from src.network import Network, ParsedTransferPage, RequestCancelledError, RetryExhaustedError, UNKNOWN_RESULT
 from src.operations import CancellationRequested, Operations, PrefetchState
 from src.utils import TransferParams
 
@@ -438,10 +438,11 @@ def test_copy_share_results_contains_only_successful_links_in_order(monkeypatch,
         {"isdir": index % 2, "server_filename": f"item-{index}", "fs_id": index}
         for index in range(4)
     ]
-    responses = iter([
+    responses = [
         "https://pan.baidu.com/s/1first", -6, UNKNOWN_RESULT,
         "https://pan.baidu.com/s/1last",
-    ])
+    ]
+    monkeypatch.setattr(operation.network, "_wait_before_retry", lambda _event: None)
     codes = iter(["abcd", "2345", "efgh", "6789"])
     monkeypatch.setattr("src.operations.generate_code", lambda: next(codes))
     passwords = []
@@ -449,7 +450,7 @@ def test_copy_share_results_contains_only_successful_links_in_order(monkeypatch,
     def create_share(_fs_id, _expiry, password):
         assert operation.root.button_copy_share.options["state"] == "disabled"
         passwords.append(password)
-        return next(responses)
+        return responses[_fs_id]
 
     operation.network.create_share = create_share
     operation.share(SimpleNamespace(result=("永久", "1234", random_password)))
@@ -469,14 +470,16 @@ def test_copy_share_results_contains_only_successful_links_in_order(monkeypatch,
     assert passwords == (["abcd", "2345", "efgh", "6789"] if random_password else ["1234"] * 4)
     assert operation.root.button_copy_share.options["state"] == "normal"
     assert operation.root.label_status.options["text"] == "已复制 2 条分享结果"
-    assert operation.completed_task_count == 4
+    assert operation.completed_task_count == 2
+    assert operation.share_resume_available is True
     assert "分享失败" in operation.root.text_logs.value
     assert "分享结果未知" in operation.root.text_logs.value
 
 
 @pytest.mark.parametrize("response", [-6, UNKNOWN_RESULT, ValueError("bad response")])
-def test_share_without_success_keeps_copy_disabled_and_clipboard_untouched(response):
+def test_share_without_success_keeps_copy_disabled_and_clipboard_untouched(response, monkeypatch):
     operation = make_save_operation("")
+    monkeypatch.setattr(operation.network, "_wait_before_retry", lambda _event: None)
     operation.network.get_dir_list = lambda *_args: [
         {"isdir": 0, "server_filename": "file", "fs_id": 1},
     ]
@@ -496,6 +499,214 @@ def test_share_without_success_keeps_copy_disabled_and_clipboard_untouched(respo
     assert operation.share_results == []
     assert operation.root.button_copy_share.options["state"] == "disabled"
     assert clipboard == ["keep this"]
+
+
+@pytest.mark.parametrize("custom_mode", [True, False])
+@pytest.mark.parametrize("folder_name", ["", "target"])
+def test_share_ignores_custom_directory_mode(custom_mode, folder_name):
+    operation = make_save_operation("")
+    operation.root.var_custom_mode.value = custom_mode
+    operation.root.entry_folder_name.value = folder_name
+    listed = []
+    shared = []
+    items = [
+        {"isdir": 1, "server_filename": "folder", "fs_id": 1},
+        {"isdir": 0, "server_filename": "file.txt", "fs_id": 2},
+    ]
+
+    def get_dir_list(path):
+        listed.append(path)
+        return items
+
+    def create_share(fs_id, expiry, password):
+        shared.append((fs_id, expiry, password))
+        return f"https://pan.baidu.com/s/1item{fs_id}"
+
+    operation.network.get_dir_list = get_dir_list
+    operation.network.create_share = create_share
+    operation.network.create_dir = lambda *_args: pytest.fail("Sharing must not create directories")
+    operation.network.transfer_file = lambda *_args, **_kwargs: pytest.fail("Sharing must not transfer files")
+
+    operation.share(SimpleNamespace(result=("永久", "1234", False)))
+
+    assert listed == [f"/{folder_name}"]
+    assert shared == [(1, 0, "1234"), (2, 0, "1234")]
+    assert operation.completed_task_count == operation.total_task_count == 2
+    assert operation.share_resume_available is False
+    assert operation.root.var_custom_mode.value is custom_mode
+
+
+def test_share_recovers_both_failed_items_in_a_hundred_without_replaying_successes(monkeypatch):
+    operation = make_save_operation("")
+    operation.network.get_dir_list = lambda *_args: [
+        {"isdir": 1, "server_filename": str(fs_id), "fs_id": fs_id}
+        for fs_id in range(1, 101)
+    ]
+    attempts = {}
+    passwords = {}
+    codes = iter(f"{index:04}" for index in range(100))
+    monkeypatch.setattr("src.operations.generate_code", lambda: next(codes))
+    monkeypatch.setattr(operation.network, "_wait_before_retry", lambda _event: None)
+
+    def post(**kwargs):
+        fs_id = json.loads(kwargs["data"]["fid_list"])[0]
+        attempts[fs_id] = attempts.get(fs_id, 0) + 1
+        passwords.setdefault(fs_id, []).append(kwargs["data"]["pwd"])
+        payload = (
+            {"errno": 2} if fs_id in (7, 99) and attempts[fs_id] <= 5
+            else {"errno": 0, "link": f"https://pan.baidu.com/s/1item{fs_id}"}
+        )
+        return SimpleNamespace(json=lambda: payload, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(operation.network.s, "post", post)
+
+    operation.share(SimpleNamespace(result=("永久", "1234", True)))
+
+    assert operation.completed_task_count == operation.total_task_count == 100
+    assert len(operation.share_results) == 100
+    assert attempts == {fs_id: 6 if fs_id in (7, 99) else 1 for fs_id in range(1, 101)}
+    assert all(len(set(values)) == 1 for values in passwords.values())
+    assert operation.pending_share_items == []
+    assert operation.share_resume_available is False
+    assert operation.metrics.snapshot()["stages"]["share"]["requests"] == 110
+    assert "分享自动补试 1/2" in operation.root.text_logs.value
+    assert "成功 100/100，未成功 0" in operation.root.text_logs.value
+
+
+def test_incomplete_share_can_resume_only_failed_items_without_opening_dialog(monkeypatch):
+    operation = make_save_operation("")
+    operation.network.get_dir_list = lambda *_args: [
+        {"isdir": 1, "server_filename": str(fs_id), "fs_id": fs_id}
+        for fs_id in (7, 99)
+    ]
+    monkeypatch.setattr(operation.network, "_wait_before_retry", lambda _event: None)
+    codes = iter(["abcd", "efgh"])
+    monkeypatch.setattr("src.operations.generate_code", lambda: next(codes))
+    calls = []
+    recovered = False
+
+    def create_share(fs_id, _expiry, password):
+        calls.append((fs_id, password))
+        if fs_id == 99 and not recovered:
+            raise RetryExhaustedError(2)
+        return f"https://pan.baidu.com/s/1item{fs_id}"
+
+    operation.network.create_share = create_share
+    operation.share(SimpleNamespace(result=("永久", "1234", True)))
+
+    assert operation.completed_task_count == 1
+    assert operation.share_resume_available is True
+    assert operation.root.bottom_share.options["text"] == "继续分享"
+    assert operation.root.bottom_save.options["state"] == "disabled"
+    assert "分享未完成：成功 1/2，未成功 1" in operation.root.label_status.options["text"]
+    assert calls == [(7, "abcd"), (99, "efgh"), (99, "efgh"), (99, "efgh")]
+    assert operation.root.button_copy_share.options["state"] == "normal"
+    recovered = True
+    operation.root.entry_folder_name.value = "changed target"
+    operation.root.text_links.value = "changed input"
+    monkeypatch.setattr(
+        operation.network, "get_dir_list",
+        lambda *_args: pytest.fail("Resuming share must not reload or replace the batch"),
+    )
+    monkeypatch.setattr(
+        "src.operations.CustomDialog",
+        lambda *_args: pytest.fail("Resuming share must reuse the original settings"),
+    )
+    monkeypatch.setattr("src.operations.thread_it", lambda method, *args: method(*args))
+
+    operation.start_share()
+
+    assert calls[-1] == (99, "efgh")
+    assert calls.count((7, "abcd")) == 1
+    assert operation.completed_task_count == operation.total_task_count == 2
+    assert len(operation.share_results) == 2
+    assert operation.pending_share_items == []
+    assert operation.share_resume_available is False
+    assert operation.folder_name == "target"
+    assert operation.root.bottom_share.options["text"] == "批量分享"
+    assert operation.root.bottom_save.options["state"] == "normal"
+
+
+def test_permanent_share_failure_is_retained_without_automatic_replay(monkeypatch):
+    operation = make_save_operation("")
+    operation.network.get_dir_list = lambda *_args: [
+        {"isdir": 1, "server_filename": "99", "fs_id": 99},
+    ]
+    calls = []
+    operation.network.create_share = lambda *_args: calls.append(True) or -6
+    monkeypatch.setattr(
+        operation.network, "_wait_before_retry",
+        lambda _event: pytest.fail("Permanent failures must not start another round"),
+    )
+
+    operation.share(SimpleNamespace(result=("永久", "1234", False)))
+
+    assert calls == [True]
+    assert operation.completed_task_count == 0
+    assert operation.share_resume_available is True
+    assert "分享未完成：成功 0/1" in operation.root.label_status.options["text"]
+
+
+def test_share_cancellation_keeps_the_pending_item_for_resume():
+    operation = make_save_operation("")
+    operation.network.get_dir_list = lambda *_args: [
+        {"isdir": 1, "server_filename": "99", "fs_id": 99},
+    ]
+
+    def cancel_share(*_args):
+        operation.cancel_event.set()
+        raise RequestCancelledError()
+
+    operation.network.create_share = cancel_share
+    operation.share(SimpleNamespace(result=("永久", "1234", False)))
+
+    assert operation.completed_task_count == 0
+    assert operation.share_resume_available is True
+    assert [info["fs_id"] for info in operation.pending_share_items] == [99]
+    assert "分享时发生未预料错误" not in operation.root.text_logs.value
+
+
+def test_share_round_backoff_can_be_cancelled_without_losing_pending_items(monkeypatch):
+    operation = make_save_operation("")
+    operation.network.get_dir_list = lambda *_args: [
+        {"isdir": 1, "server_filename": "99", "fs_id": 99},
+    ]
+    calls = []
+    operation.network.create_share = lambda *_args: calls.append(True) or 2
+
+    def cancel_backoff(_event):
+        operation.cancel_event.set()
+        raise RequestCancelledError()
+
+    monkeypatch.setattr(operation.network, "_wait_before_retry", cancel_backoff)
+
+    operation.share(SimpleNamespace(result=("永久", "1234", False)))
+
+    assert calls == [True]
+    assert operation.share_resume_available is True
+    assert [info["fs_id"] for info in operation.pending_share_items] == [99]
+    assert "分享程序中断" not in operation.root.text_logs.value
+
+
+def test_unknown_share_result_is_retained_without_automatic_replay(monkeypatch):
+    operation = make_save_operation("")
+    operation.network.get_dir_list = lambda *_args: [
+        {"isdir": 1, "server_filename": "99", "fs_id": 99},
+    ]
+    calls = []
+    operation.network.create_share = lambda *_args: calls.append(True) or UNKNOWN_RESULT
+    monkeypatch.setattr(
+        operation.network, "_wait_before_retry",
+        lambda _event: pytest.fail("Unknown outcomes must not start another round"),
+    )
+
+    operation.share(SimpleNamespace(result=("永久", "1234", False)))
+
+    assert calls == [True]
+    assert operation.completed_task_count == 0
+    assert operation.share_resume_available is True
+    assert "分享结果未知" in operation.root.text_logs.value
+    assert "分享未完成：成功 0/1" in operation.root.label_status.options["text"]
 
 
 @pytest.mark.parametrize("task", ["save", "share", "successful_share"])
@@ -1335,14 +1546,15 @@ def test_share_item_exception_does_not_stop_following_items():
     def create_share(fs_id, *_args):
         calls.append(fs_id)
         if fs_id == 1:
-            raise ValueError("malformed share item")
+            raise RuntimeError("malformed share item")
         return "https://pan.baidu.com/s/1shared"
 
     operation.network.create_share = create_share
     operation.handle_process_share()
 
     assert calls == [1, 2]
-    assert operation.completed_task_count == 2
+    assert operation.completed_task_count == 1
+    assert [info["fs_id"] for info in operation.pending_share_items] == [1]
     assert "malformed share item" in operation.root.text_logs.value
     assert "分享成功" in operation.root.text_logs.value
 
@@ -2383,7 +2595,7 @@ def test_new_batch_resets_the_checkpoint_after_completion():
     assert operation.root.text_logs.value.count("转存成功") == 1
 
 
-@pytest.mark.parametrize("batch", ["idle", "completed", "interrupted", "shared"])
+@pytest.mark.parametrize("batch", ["idle", "completed", "interrupted", "shared", "share_incomplete"])
 def test_reset_progress_clears_the_batch_and_preserves_inputs_and_logs(batch):
     operation = make_save_operation(
         "https://pan.baidu.com/s/1first 1234\n"
@@ -2393,11 +2605,13 @@ def test_reset_progress_clears_the_batch_and_preserves_inputs_and_logs(batch):
         interrupt_before_second_item(operation)
     if batch in ("completed", "interrupted"):
         operation.save()
-    elif batch == "shared":
+    elif batch in ("shared", "share_incomplete"):
         operation.network.get_dir_list = lambda *_args: [
             {"isdir": 0, "server_filename": "file", "fs_id": 1},
         ]
-        operation.network.create_share = lambda *_args: "https://pan.baidu.com/s/1shared"
+        operation.network.create_share = lambda *_args: (
+            -6 if batch == "share_incomplete" else "https://pan.baidu.com/s/1shared"
+        )
         operation.share(SimpleNamespace(result=("永久", "1234", False)))
     logs = operation.root.text_logs.value
     session = operation.network.s
@@ -2416,6 +2630,10 @@ def test_reset_progress_clears_the_batch_and_preserves_inputs_and_logs(batch):
     assert operation.prefetch_states == operation.transfer_params_cache == {}
     assert prefetch.cancel_event.is_set()
     assert operation.resume_available is operation.running is operation._reset_pending is False
+    assert operation.share_resume_available is False
+    assert operation.pending_share_items == []
+    assert operation.share_passwords == {}
+    assert operation.share_retryable_ids == operation.completed_share_ids == set()
     assert not operation.cancel_event.is_set()
     assert operation.worker_thread is operation._ui_snapshot is None
     assert operation.network.s is not session

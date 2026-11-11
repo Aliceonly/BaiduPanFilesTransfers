@@ -22,6 +22,7 @@ import requests
 from src.constants import EXP_MAP, DELAY_SECONDS, INVALID_CHARS, ERROR_CODES, SAVE_LIMIT, COLOR_MAP
 from src.network import (
     Network, ParsedTransferPage, RequestCancelledError, RetryExhaustedError, UNKNOWN_RESULT,
+    NON_RETRYABLE_SHARE_CODES,
 )
 from src.metrics import RequestMetrics
 from src.prefetch import PrefetchPool, PrefetchState
@@ -81,6 +82,7 @@ class Operations:
 
     PREFETCH_WORKERS = 2
     CUSTOM_TRANSFER_ATTEMPTS = 3
+    SHARE_ROUNDS = 3
 
     def __init__(self, root):
         self.root = root
@@ -125,10 +127,15 @@ class Operations:
         self.total_task_count = 0
         self.valid_link_count = 0
         self.resume_available = False
+        self.share_resume_available = False
+        self.pending_share_items = []
+        self.share_passwords = {}
+        self.share_retryable_ids = set()
+        self.completed_share_ids = set()
 
     def start_save(self, resume: bool = False) -> None:
         """从 UI thread 启动转存 worker。"""
-        if self._reset_pending or self.is_worker_alive():
+        if self._reset_pending or self.is_worker_alive() or self.share_resume_available:
             return
         self.cancel_event.clear()
         self._ui_snapshot = self._capture_ui_snapshot()
@@ -139,6 +146,11 @@ class Operations:
         if self._reset_pending or self.is_worker_alive():
             return
         if self.resume_available:
+            return
+        if self.share_resume_available:
+            self.cancel_event.clear()
+            self._ui_snapshot = self._capture_ui_snapshot()
+            self.worker_thread = thread_it(self.share)
             return
         dialog_result = CustomDialog(self.root)
         if dialog_result.result:
@@ -327,6 +339,8 @@ class Operations:
 
         :param resume: 从内存中保留的断点继续，不重新读取链接或重置任务状态。
         """
+        if self.share_resume_available:
+            return
         if not self._run_lock.acquire(blocking=False):
             return
         if resume and not self.resume_available:
@@ -380,11 +394,12 @@ class Operations:
         """
         if self.resume_available:
             return
-        if dialog_result is None:
+        resume = self.share_resume_available
+        if dialog_result is None and not resume:
             # Direct callers may still use share() synchronously. The normal
             # UI path creates this dialog in start_share on the main thread.
             dialog_result = CustomDialog(self.root)
-        if not dialog_result.result:
+        if not resume and not dialog_result.result:
             return
         if not self._run_lock.acquire(blocking=False):
             return
@@ -392,12 +407,17 @@ class Operations:
             self._run_lock.release()
             return
         try:
-            self.dialog_result = dialog_result
-            self.prepare_run()
+            if not resume:
+                self.dialog_result = dialog_result
+            self.prepare_run(resume=resume)
             self.handle_input(task_count_check=False)
             self.handle_bdstoken()
-            self.handle_list_dir()
-            self.setup_share()
+            if not resume:
+                self.handle_list_dir()
+                self.setup_share()
+            else:
+                self.change_status('sharing')
+                self.insert_logs(f'继续分享：仅重试 {len(self.pending_share_items)} 个未成功条目。')
             self.handle_process_share()
         except CancellationRequested:
             pass
@@ -411,7 +431,8 @@ class Operations:
                     self.network.s.close()
                 finally:
                     self._log_performance()
-                    self.change_status('stopped')
+                    self.share_resume_available = bool(self.pending_share_items)
+                    self.change_status('share_incomplete' if self.share_resume_available else 'stopped')
             finally:
                 self._run_lock.release()
 
@@ -574,6 +595,7 @@ class Operations:
         self.expiry, self.password, self.random_password = self.dialog_result.result
         # 更新任务总数和状态
         self.total_task_count = len(self.dir_list_all)
+        self.pending_share_items = list(self.dir_list_all)
         self.change_status('sharing')
 
     def handle_input(self, task_count_check: bool = True) -> None:
@@ -587,7 +609,7 @@ class Operations:
 
         # cookie 带非 ascii 字符，或不包含 BAIDUID 时，铁定不对
         self.check_condition(not self.cookie.isascii() or self.cookie.find('BAIDUID') == -1,
-                             message='百度网盘 cookie 输入不正确，请查看使用帮助。')
+                             message='百度网盘 cookie 输入不正确，请重新复制完整 Cookie（需包含 BAIDUID）。')
         # 非法字符由官方规定的。符号 / 可以使用，作为子目录的分隔符
         self.check_condition(any(char in self.folder_name for char in INVALID_CHARS),
                              message=r'转存目录名有非法字符，不能包含：< > | * ? \ :')
@@ -677,9 +699,36 @@ class Operations:
 
     def handle_process_share(self) -> None:
         """执行批量分享"""
-        for info in self.dir_list_all:
-            self._check_cancelled()
-            self.process_share(info)
+        if not self.pending_share_items:
+            self.pending_share_items = [
+                info for info in self.dir_list_all
+                if info.get('fs_id') not in self.completed_share_ids
+            ]
+        for share_round in range(1, self.SHARE_ROUNDS + 1):
+            candidates = [
+                info for info in self.pending_share_items
+                if share_round == 1 or info.get('fs_id') in self.share_retryable_ids
+            ]
+            if not candidates:
+                break
+            if share_round > 1:
+                self.insert_logs(
+                    f'分享自动补试 {share_round - 1}/{self.SHARE_ROUNDS - 1}：'
+                    f'剩余 {len(candidates)} 个临时失败条目。'
+                )
+                try:
+                    self.network._wait_before_retry(self.cancel_event)
+                except RequestCancelledError as error:
+                    raise CancellationRequested() from error
+            for info in candidates:
+                self._check_cancelled()
+                if self.process_share(info):
+                    self.pending_share_items.remove(info)
+        self.share_resume_available = bool(self.pending_share_items)
+        self.insert_logs(
+            f'分享统计：成功 {self.completed_task_count}/{self.total_task_count}，'
+            f'未成功 {len(self.pending_share_items)}。'
+        )
 
     def process_save(self, url_code: str, raw_link: str = '') -> bool:
         """执行转存操作并记录结果"""
@@ -708,8 +757,12 @@ class Operations:
             self.insert_logs(f'转存时发生未预料错误：{e}：{url_code}')
             return self.next_task_index not in self.unknown_transfer_tasks
 
-    def process_share(self, info: Dict[str, Any]) -> None:
+    def process_share(self, info: Dict[str, Any]) -> bool:
         """执行分享操作并记录结果"""
+        fs_id = info.get('fs_id')
+        if fs_id in self.completed_share_ids:
+            return True
+        self.share_retryable_ids.discard(fs_id)
         try:
             # 插入要分享的文件或文件夹到链接输入框，对文件夹加入 "/" 标记来区别
             is_dir = "/" if info["isdir"] == 1 else ""
@@ -717,7 +770,11 @@ class Operations:
             msg = f'目录：{filename}' if is_dir else f'文件：{filename}'
             self.insert_logs(msg, alt=True)
 
-            password = self.password if not self.random_password else generate_code()
+            if fs_id not in self.share_passwords:
+                self.share_passwords[fs_id] = (
+                    self.password if not self.random_password else generate_code()
+                )
+            password = self.share_passwords[fs_id]
             r = self._network_call(
                 self.network.create_share,
                 info['fs_id'], EXP_MAP[self.expiry], password,
@@ -728,20 +785,30 @@ class Operations:
                 share_link = f'{r}?pwd={password}'
                 share_result = f'{share_link} {msg}'
                 self.share_results.append(share_result)
+                self.completed_share_ids.add(fs_id)
+                self.change_status('update')
                 result = f'分享成功：{share_result}'
             else:
+                if r not in NON_RETRYABLE_SHARE_CODES:
+                    self.share_retryable_ids.add(fs_id)
                 result = f'分享失败：错误代码（{r}） {msg}'
             self.insert_logs(result)
+            return fs_id in self.completed_share_ids
+        except CancellationRequested:
+            raise
+        except RetryableTaskError as error:
+            self.share_retryable_ids.add(fs_id)
+            self.insert_logs(f'分享暂未成功，保留条目：{error}：{info}')
+            return False
         except Exception as e:
             self.insert_logs(f'分享时发生未预料错误：{e}：{info}')
-        finally:
-            self.change_status('update')
+            return False
 
     def change_status(self, status: str) -> None:
         """更新内部运行状态，并把 Tk 控件更新排入 UI thread。"""
         if status == 'running':
             self.running = True
-        elif status in ('paused', 'interrupted', 'stopped', 'error'):
+        elif status in ('paused', 'interrupted', 'share_incomplete', 'stopped', 'error'):
             self.running = False
         elif status == 'update':
             self.completed_task_count += 1
@@ -786,6 +853,16 @@ class Operations:
             self.root.text_links.config(fg=COLOR_MAP['text'])
             self.root.bottom_share.config(state="disabled")
             self.root.bottom_save.config(state="disabled")
+        elif status == 'share_incomplete':
+            self.root.label_status.config(
+                text=f'分享未完成：成功 {self.completed_task_count}/{self.total_task_count}，'
+                     f'未成功 {len(self.pending_share_items)}，可继续分享',
+                bootstyle='warning',
+            )
+            self.root.bottom_share.config(
+                text='继续分享', state='normal', bootstyle='warning', command=self.start_share,
+            )
+            self.root.bottom_save.config(state='disabled')
         elif status == 'error':
             self.root.label_status.config(text='发生错误：', bootstyle='danger')
         else:
@@ -793,10 +870,12 @@ class Operations:
                 text='批量转存', state="normal", bootstyle='primary',
                 command=self.start_save,
             )
-            self.root.bottom_share.config(state="normal", command=self.start_share)
+            self.root.bottom_share.config(
+                text='批量分享', state='normal', bootstyle='primary', command=self.start_share,
+            )
 
         self.root.button_copy_share.config(
-            state='normal' if status == 'stopped' and self.share_results else 'disabled',
+            state='normal' if status in ('stopped', 'share_incomplete') and self.share_results else 'disabled',
         )
 
     def check_condition(self, condition: bool, message: str) -> None:

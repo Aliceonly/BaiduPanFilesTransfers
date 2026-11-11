@@ -29,6 +29,7 @@ NON_RETRYABLE_CODES = frozenset({
     -1, -4, -6, -7, -8, -9, -10, -12, -62, 2, 4, 12, 20, 105, 404,
 })
 NON_RETRYABLE_TRANSFER_CODES = NON_RETRYABLE_CODES
+NON_RETRYABLE_SHARE_CODES = NON_RETRYABLE_CODES - {2}
 RetryCallback = Optional[Callable[[int, Any], None]]
 
 
@@ -121,6 +122,7 @@ class Network:
         unknown_on_exhaustion: bool = False,
         validator: Optional[Callable[[dict], None]] = None,
         cancel_event: Optional[threading.Event] = None,
+        non_retryable_codes: frozenset = NON_RETRYABLE_CODES,
     ) -> Union[dict, int, str]:
         """
         发送 JSON API 请求并统一处理 retry。
@@ -161,7 +163,7 @@ class Network:
                 # arrived in flight; do not replay a confirmed success on resume.
                 if errno == 0:
                     return payload
-                if errno in NON_RETRYABLE_CODES:
+                if errno in non_retryable_codes:
                     return UNKNOWN_RESULT if result_unknown else payload
                 self._check_cancelled(cancel_event)
                 if attempt == REQUEST_ATTEMPTS:
@@ -596,6 +598,7 @@ class Network:
             unknown_on_exhaustion=True,
             validator=validate,
             cancel_event=cancel_event,
+            non_retryable_codes=NON_RETRYABLE_SHARE_CODES,
         )
         if payload == UNKNOWN_RESULT:
             return UNKNOWN_RESULT

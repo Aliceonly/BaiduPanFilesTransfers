@@ -9,13 +9,12 @@
 import re
 import time
 from tkinter import PhotoImage
-import webbrowser
 from typing import Callable
 
 import ttkbootstrap as ttk
 from ttkbootstrap.dialogs import Messagebox
 
-from src.constants import COLOR_THEME, LABEL_MAP, EXP_MAP, MW_PADDING, MAIN_TITLE, MAIN_VERSION, HOME_PAGE, TOOLTIP_PADDING, TOOLTIP_DELAY, COLOR_MAP
+from src.constants import COLOR_THEME, LABEL_MAP, EXP_MAP, MW_PADDING, MAIN_TITLE, MAIN_VERSION, TOOLTIP_PADDING, TOOLTIP_DELAY, COLOR_MAP
 from src.utils import read_config, create_icon
 
 
@@ -59,7 +58,7 @@ class MainWindow(ttk.Window):
         self.frame_options = ttk.Labelframe(self, text=LABEL_MAP['options'], padding="10 10 0 9")
         self.frame_options.grid(row=init_row + 6, sticky='w', padx=MW_PADDING)
         self.var_trust_env = self._create_checkbutton(LABEL_MAP['trust'], LABEL_MAP['trust_tip'], 0)
-        self.var_custom_mode = self._create_checkbutton(LABEL_MAP['custom'], LABEL_MAP['custom_tip'], 1)
+        self.var_custom_mode = self._create_checkbutton(LABEL_MAP['custom'], LABEL_MAP['custom_tip'], 1, default=True)
         self.var_check_mode = self._create_checkbutton(LABEL_MAP['check'], LABEL_MAP['check_tip'], 2)
         # 创建按钮容器和两个功能按钮
         self.frame_bottom = ttk.Frame(self)
@@ -70,9 +69,8 @@ class MainWindow(ttk.Window):
         self.frame_status = ttk.Frame(self)
         self.frame_status.grid(row=init_row + 7, sticky='e', padx=MW_PADDING, pady=MW_PADDING)
         # noinspection PyArgumentList
-        self.label_status = ttk.Label(self.frame_status, text=LABEL_MAP['help'], font=('', 10, 'underline'), bootstyle='primary', cursor='heart')
+        self.label_status = ttk.Label(self.frame_status, text='总进度：0/0', font=('', 10), bootstyle='primary')
         self.label_status.grid(row=0, column=0, padx=(0, 10))
-        self.label_status.bind("<Button-1>", lambda e: webbrowser.open(HOME_PAGE))
         self.button_copy_share = ttk.Button(
             self.frame_status, text=LABEL_MAP['copy_share'],
             command=self._copy_button_click, state='disabled',
@@ -92,9 +90,9 @@ class MainWindow(ttk.Window):
         entry.grid(row=row + 1, sticky='we', padx=MW_PADDING, pady=MW_PADDING)
         return entry
 
-    def _create_checkbutton(self, text: str, tooltip: str, column: int) -> ttk.BooleanVar:
+    def _create_checkbutton(self, text: str, tooltip: str, column: int, default: bool = False) -> ttk.BooleanVar:
         """建立设置复选框"""
-        var = ttk.BooleanVar()
+        var = ttk.BooleanVar(value=default)
         checkbutton = ttk.Checkbutton(self.frame_options, text=text, variable=var)
         checkbutton.grid(row=0, column=column, padx=(0, 10))
         ToolTip(widget=checkbutton, text=tooltip)
@@ -272,8 +270,9 @@ class CustomDialog(ttk.Toplevel):
         self.password_entry = ttk.Entry(master, textvariable=self.var_password, bootstyle="info")
         self.password_entry.grid(row=1, column=1, sticky='ew', padx=5, pady=2)
         # 随机提取码选项
-        self.var_random_pass = ttk.BooleanVar()
+        self.var_random_pass = ttk.BooleanVar(self, value=True)
         ttk.Checkbutton(master, text=LABEL_MAP['password_random'], variable=self.var_random_pass, command=self.toggle_password_entry).grid(row=1, column=1, sticky='e', padx=10, pady=2)
+        self.toggle_password_entry()
         # 在两个 frame 之间插入分割线
         ttk.Separator(self, orient='horizontal').pack(fill="x")
         # 底部按钮
